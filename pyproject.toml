@@ -1,0 +1,48 @@
+[project]
+name = "intlroam-api"
+version = "0.1.0"
+description = "IntlRoam Phase 2 backend API"
+requires-python = ">=3.11"
+dependencies = [
+    # Web 框架
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    # 数据库
+    "sqlalchemy[asyncio]>=2.0.30",
+    "asyncpg>=0.30.0",
+    "alembic>=1.13.0",
+    # Redis
+    "redis>=5.2.0",
+    # Pydantic + 配置
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    # LLM
+    "google-genai>=0.3.0",
+    "httpx>=0.27.0",
+    # 日志
+    "structlog>=24.4.0",
+    # 监控
+    "prometheus-fastapi-instrumentator>=7.0.0",
+    "psycopg[binary]>=3.3.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+    "ruff>=0.7.0",
+    "mypy>=1.13.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]  # line length, ruff format will handle
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

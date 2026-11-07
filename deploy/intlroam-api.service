@@ -1,0 +1,44 @@
+[Unit]
+Description=IntlRoam API v2 (FastAPI)
+After=network.target postgresql.service redis-server.service
+Requires=postgresql.service redis-server.service
+
+[Service]
+Type=exec
+User=intlroam
+Group=intlroam
+WorkingDirectory=/opt/intlroam_api
+EnvironmentFile=/opt/intlroam_api/.env
+
+# 用 uv 运行
+ExecStart=/home/intlroam/.local/bin/uv run uvicorn app.main:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --workers 2 \
+    --proxy-headers \
+    --forwarded-allow-ips=127.0.0.1
+
+Restart=always
+RestartSec=5
+
+# 资源限制
+LimitNOFILE=65536
+
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/intlroam_api /var/log
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# 日志输出到 journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=intlroam-api
+
+[Install]
+WantedBy=multi-user.target

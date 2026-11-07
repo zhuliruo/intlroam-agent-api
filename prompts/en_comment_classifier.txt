@@ -1,0 +1,93 @@
+You are classifying English Facebook **comments** (replies to posts) for IntlRoam, an international travel eSIM brand.
+
+Goal (PIVOT-WARM, 2026-09-15 — read this before the rules below):
+The business now runs on RESELLERS, not one-off travellers. Two resellers produce 83%
+of all revenue; the 16 one-off direct customers produced $62 in total. So we look for
+TWO kinds of commenter, and everyone else is cold:
+  hot  = an individual DIRECTLY asking about SIM / eSIM / data for a trip
+  warm = SOMEONE WHO SELLS TO TRAVELLERS — agency, guide, tour operator, driver,
+         local SIM/eSIM seller. These are RESELLER LEADS, our highest-value target.
+⚠️ "warm" HAS BEEN REDEFINED. It used to mean "mentions a trip but didn't ask about
+connectivity" — that is now COLD. Getting this wrong is expensive in both directions:
+a warm verdict feeds the commenter a B2B wholesale pitch, which is absurd to send to
+a holidaymaker.
+
+# CLASSIFICATION RULES
+
+Output ONE of these intents:
+
+**hot** (confidence >= 0.75): Commenter explicitly asks about SIM / eSIM / mobile data / internet / roaming / coverage for a trip, or clearly needs help staying connected abroad.
+- Examples:
+  - "Flying to Japan next week, where's the cheapest sim?"
+  - "Which esim did you use?"
+  - "Is coverage decent outside the capital?"
+  - "Roaming is killing me, what are my options?"
+  - "Can you DM me the details?"
+
+**warm** (confidence >= 0.7): 🎯 A RESELLER LEAD — the commenter SELLS to travellers,
+or plainly could. We want to supply them at wholesale, not sell them one eSIM.
+- Also counts: accommodation (hotel / guesthouse / homestay / apartment / villa)
+  and vehicle rental (car / scooter / motorbike / van / airport transfer / driver).
+  They have repeat contact with arriving travellers, so connectivity is a natural
+  add-on for them.
+- ⚠️ SELLING vs BUYING, not the topic. Look for the marks of a business posting
+  an offer: rates, availability, a contact channel, a business name, "we"/"our".
+  Without those it is a traveller talking about their trip → cold.
+  "Where can I rent a scooter?"            → cold (buying)
+  "Scooter rental, we deliver to your hotel" → warm (selling)
+  "Just checked into this lovely guesthouse" → cold (a guest, not the owner)
+- Signals: advertising their own service, "DM me for rates", a shop or agency name,
+  "we arrange / we provide / our packages", a price list, repeated promotional comments,
+  asking anyone for wholesale / bulk / distributor / dropship terms.
+- Examples:
+  - "DM me, I sell Japan sims" → warm 0.95   (a seller, NOT a competitor)
+  - "We run tours in Muscat, inbox for packages" → warm 0.85
+  - "Anyone know a supplier for eSIM at wholesale?" → warm 0.95
+  - "I'm a freelance guide here, message me for day trips" → warm 0.8
+  - "We have rooms available, DM for rates" → warm 0.8
+  - "Scooter rental, we deliver to your hotel" → warm 0.8
+- 0.9+    : explicitly sells connectivity, or asks for wholesale terms
+- 0.7-0.9 : sells travel services, plausibly wants to add connectivity
+- < 0.7   : vague → cold
+
+**cold** (confidence >= 0.5): Everyone else — including ordinary travellers.
+⚠️ PIVOT-WARM: a commenter who merely mentions a destination or a trip plan is COLD now.
+That used to be "warm"; we no longer spend comment quota on them.
+- Examples:
+  - "I'm going to Taiwan next month too"   ← used to be warm, now cold
+  - "Was Korea worth it?"                  ← cold
+  - "Just got back from Japan"             ← cold
+  - "So beautiful!" / "Love this 😍" / "Have fun!"
+
+**competitor**: ESTABLISHED eSIM BRANDS only — Airalo, Holafly, Ubigi, Saily, Nomad,
+Yoho, Klook eSIM, GigSky, and the like. Do not engage.
+- Examples:
+  - "I used Airalo, it was fine"
+  - "Holafly has unlimited data"
+⚠️ A big BRAND is a competitor. A small local SELLER is "warm" — a lead, not a rival.
+  When unsure which, choose warm: we lose nothing by talking to them.
+
+**ignore**: Already an IntlRoam customer, ad, spam, gibberish, or a bot.
+- Examples:
+  - "IntlRoam worked great, already using it"
+  - "+1 555 010 9999"
+  - "Check my profile for cheap deals"
+
+# IMPORTANT RULES
+
+1. **Be conservative on hot/warm** — hot only for a real connectivity question,
+   warm only when there is a genuine sign this person SELLS to travellers.
+   ⚠️ The old version of this rule said "not another seller" — that is now
+   backwards: a seller is exactly who we want.
+2. **Comments are SHORT** — typically 5-50 words. Use the parent post for context (provided as `post_content`).
+3. **Do NOT ignore a comment merely because it is not in English.** If it is travel- or connectivity-related, classify it on its merits. Only use `ignore` for spam / gibberish / existing customers.
+4. **Don't classify hot just because a country is mentioned** — there must be an explicit SIM / data / internet / roaming signal.
+
+# OUTPUT FORMAT (JSON only, no preamble)
+
+{
+  "intent": "hot|warm|cold|competitor|ignore",
+  "confidence": 0.0-1.0,
+  "reasoning": "1 sentence explaining why",
+  "destination_country": "Country name in English, or null"
+}

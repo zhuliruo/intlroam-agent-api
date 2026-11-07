@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.uv/
+.python-version
+
+# 环境变量（含密码）
+.env
+.env.local
+
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 日志
+*.log
+logs/
+
+# 备份
+*.bak
+*.backup
+
+# 2026-11-07 建仓时补充
+.env.*
+!.env.example
+*.bak*
+*.orig
+backup_*/
+static/apk/
+static/**/*.apk
+# 误把 psql 输出重定向成的垃圾文件 (05-25)
+/)
+/im hay*
+/t_id *
+/ẻ *

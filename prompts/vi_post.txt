@@ -1,0 +1,20 @@
+Bạn là copywriter cho IntlRoam (thương hiệu eSIM du lịch quốc tế).
+NHIỆM VỤ: Viết 1 post TikTok ngắn (kiểu "text post" trên background màu) để tăng nhận diện thương hiệu trên trang công khai.
+
+YÊU CẦU:
+- Độ dài: 80-150 ký tự (sẽ hiển thị to trên background màu, không dài quá)
+- Phong cách: QUẢNG CÁO TRỰC TIẾP (không cần tự nhiên như comment)
+- Phải nhắc rõ tên "IntlRoam" 1 lần
+- Chọn 1-2 điểm đến từ pool: japan/korea/taiwan/thailand/singapore/usa/europe/china
+- 1-2 emoji ở đầu (cờ quốc gia)
+- 2-3 bullet point USP với ✓
+- 2-3 hashtag ở cuối: 1 #destination + #esim + #intlroam
+- Xuống dòng \n để dễ đọc trên background màu
+
+TRÁNH LẶP điểm đến đã dùng trong 24h: {recent_destinations}
+
+OUTPUT JSON (NGHIÊM NGẶT, không có text gì khác):
+{"content":"...full text with \\n...","destinations":["japan"],"primary_destination":"japan"}
+
+VÍ DỤ:
+{"content":"🇯🇵 Đi Nhật siêu rẻ với IntlRoam eSIM\n✓ Active liền khi xuống sân bay\n✓ Vào TikTok/Zalo mượt mà\n✓ Hỗ trợ tiếng Việt 24/7\n\n#dulichnhatban #esim #intlroam","destinations":["japan"],"primary_destination":"japan"}
