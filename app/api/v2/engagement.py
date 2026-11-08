@@ -140,9 +140,12 @@ Customer = them). Write your NEXT message only.
 - If they ask for materials / brochure / catalogue / price list, send the brochure link
   (one short line around it).
 - Set "handover": true (and say a colleague will contact them shortly with the details; if
-  you haven't sent the brochure yet, add its link) as soon as they show ANY interest: want
-  details / prices / commission / how to start / to try, OR they want to buy eSIMs for
-  themselves, OR they ask for a call or a real person.
+  you haven't sent the brochure yet, add its link) only when their OWN WORDS show interest:
+  they ask for details / prices / commission / how to start / to try, say yes / interested,
+  OR they want to buy eSIMs for themselves, OR they ask for a call or a real person.
+- NOT interest (no handover): an emoji, a sticker, a photo, "ok", "thanks", "hi", "who is
+  this?", "?" — just reply briefly (introduce / ask if they'd like to know more).
+- Lines in [brackets] like "[they sent a photo]" describe a media message, not words.
 - "lead_type": "reseller" if they are interested in selling/partnering, "customer" if they want
   to buy for their own trip, else null.
 - If they are not interested, ask you to stop, or say it's the wrong number: reply with one
@@ -248,6 +251,65 @@ def _new_lines(their_text: str, history: list[dict]) -> str:
     return "\n".join(keep).strip()
 
 
+# ─────────── WhatsApp/Zalo 通知文字清洗 (11-08) ───────────
+# 手机把通知正文原样传上来; 测试机系统是中文, 所以"对方点了个 ❤️"会变成
+#   对“<我们的招呼原文>”留下了心情❤️
+# 这不是对方说的话: 之前被 LLM 当成"有兴趣"→ 转人工, 还因为满屏中文而用中文回了阿曼客户。
+_REACTION_RE = re.compile(
+    r"留下了心情|留下了回应|对.{0,3}[“\"].*[”\"].{0,6}(表态|回应|心情)|\breacted\b|"
+    r"bày tỏ cảm xúc|đã thả|تفاعل|تفاعلت|reagiu|reaccionó", re.I)
+_DELETED_RE = re.compile(r"此消息已(被)?删除|消息已撤回|this message was deleted|tin nhắn đã (bị )?(xóa|thu hồi)|"
+                         r"تم حذف هذه الرسالة", re.I)
+# 媒体占位 (按通知里的 emoji 判, 不依赖系统语言) → 统一成英文, 免得 LLM 看到中文就回中文
+_MEDIA = (("📷", "[they sent a photo]"), ("🎥", "[they sent a video]"), ("📹", "[they sent a video]"),
+          ("🎤", "[they sent a voice message]"), ("🎵", "[they sent an audio]"),
+          ("📄", "[they sent a document]"), ("📍", "[they sent a location]"), ("👤", "[they sent a contact]"),
+          ("👾", "[they sent a sticker]"), ("🖼", "[they sent an image]"))
+_MEDIA_WORDS_RE = re.compile(r"^(贴纸|贴图|动图|sticker|gif|nhãn dán|ملصق)$", re.I)
+
+
+def _clean_outreach_text(their_text: str, history: list[dict]) -> str:
+    """去掉表情回应 / 已删除 / 引用我们自己原话的行; 媒体占位换成英文标记。返回对方真正说的。"""
+    ours = [h.get("t", "") for h in history if h.get("r") == "us"]
+    keep = []
+    for line in (their_text or "").split("\n"):
+        s = line.strip()
+        if not s or _DELETED_RE.search(s):
+            continue
+        # 行里嵌着我们发过的原话 (≥20 字) = 对我们那条的表情回应/引用通知, 不是对方的话
+        if _REACTION_RE.search(s) or any(len(o) >= 20 and o.strip()[:20] in s for o in ours):
+            continue
+        if _MEDIA_WORDS_RE.match(s):
+            keep.append("[they sent a sticker]")
+            continue
+        tag = next((t for e, t in _MEDIA if s.startswith(e) and len(s) <= 40), None)
+        keep.append(tag or s)
+    return "\n".join(keep).strip()
+
+
+_CJK_RE = re.compile(r"[぀-ヿ㐀-鿿가-힯]")
+_ARABIC_RE = re.compile(r"[؀-ۿ]")
+_VI_RE = re.compile(r"[ăâđêôơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹ]", re.I)
+_CHINESE_REGIONS = {"CN", "HK", "TW", "MO", "SG", "MY"}
+
+
+def _outreach_language(platform: str, region: str | None, history: list[dict]) -> str:
+    """招募对话的回复语言由服务端定, 不让 LLM 被通知里的系统语言带偏。
+    以对方自己写的字为准; 没写字 (只有表情/媒体) 就跟招呼同语言: 越南→越南语, 其他→英语。"""
+    theirs = " ".join(h.get("t", "") for h in history if h.get("r") == "them")
+    theirs = re.sub(r"\[[^\]]*\]", " ", theirs)          # 去掉 [they sent a photo] 这类标记
+    if _ARABIC_RE.search(theirs):
+        return "Arabic"
+    if _VI_RE.search(theirs) or platform == "zalo" or region == "VN":
+        return "Vietnamese"
+    if _CJK_RE.search(theirs) and region in _CHINESE_REGIONS:
+        return "Chinese (same script they use)"
+    letters = re.sub(r"[\W\d_]", "", theirs)
+    if letters and not _CJK_RE.search(letters):
+        return "the same language the customer writes in (English if unsure)"
+    return "English"
+
+
 async def _llm_json(system: str, user: str, temperature: float) -> dict | None:
     res = await call_llm(system_instruction=system, user_message=user,
                          temperature=temperature, json_mode=True)
@@ -328,9 +390,11 @@ async def _gen_dm(history: list[dict], destination: str | None,
         # 招募分销商的对话: 不报价、不发产品链接 (人工接手后再给), 只用分销事实
         brochure = brochure_url(platform, region)
         vi = platform == "zalo" or region == "VN"
+        lang = _outreach_language(platform, region, history)
         system = "\n\n".join([_OUTREACH_PERSONA, _OUTREACH_TASK.format(chat=_CHAT[platform]),
                               _RULES.format(length="1-3 short sentences, under 350 characters (plus the link if sent)"),
-                              _RESELLER_FACTS.format(prices=price_lines(vi), brochure=brochure)])
+                              _RESELLER_FACTS.format(prices=price_lines(vi), brochure=brochure),
+                              f"LANGUAGE: write your reply in {lang}. This overrides every other language rule."])
         allowed = None
     else:
         facts, allowed = await _facts(destination, full=True)
@@ -362,6 +426,11 @@ async def _gen_dm(history: list[dict], destination: str | None,
         if not reply or not prices_ok(reply):
             log.info("outreach_reply_rejected", reply=(reply or "")[:200])
             out["why"] = "bad_price"
+            return out
+        if _CJK_RE.search(reply) and not lang.startswith("Chinese"):
+            # 11-08: 给阿曼旅行社回了中文 —— 不是中文对话却出现中日韩文字, 一律不发
+            log.info("outreach_reply_rejected_lang", reply=reply[:200], lang=lang)
+            out["why"] = "bad_lang"
             return out
         out["reply"] = reply
     else:
@@ -533,6 +602,16 @@ async def _claim_dm(db, device_id, tk, body, row, lead=None) -> ClaimResponse:
         lead = (await db.execute(text(
             f"SELECT id, phone_e164, source_text, region FROM {LEAD_TABLE[pf]} WHERE id=:id"), {"id": row.lead_id})).first()
     lead_id = (lead.id if lead else None) or (row.lead_id if row else None)
+    if pf in OUTREACH:
+        cleaned = _clean_outreach_text(body.their_text or "", history)
+        if cleaned != (body.their_text or "").strip():
+            log.info("outreach_text_cleaned", platform=pf, lead_id=lead_id,
+                     raw=(body.their_text or "")[:120], cleaned=cleaned[:120])
+        if not cleaned:
+            # 只是给我们的消息点了表情 / 撤回了消息: 不算回复, 不调 LLM, 不转人工, 不改线索状态
+            await db.rollback()
+            return ClaimResponse(action="skip", id=row.id if row else None, reason="reaction_only")
+        body = body.model_copy(update={"their_text": cleaned})
     if row and row.handover:
         # 已转人工: 不再自动回; 对方的新消息转进 Chatwoot 会话, 管理员能看到后续
         new = _new_lines(body.their_text or "", history)
