@@ -287,6 +287,46 @@ def _clean_outreach_text(their_text: str, history: list[dict]) -> str:
     return "\n".join(keep).strip()
 
 
+# ─────────── 商家自动回复 (11-08) ───────────
+# 实测 (9 条): 秒回的自动回复到服务端时距我们招呼 12-15s (手机防抖 8s + 上报); 测试机离线时
+# 会晚到几分钟到一天 → 还要靠开场套话认。只看对方对招呼的**第一条**回复。
+AUTO_REPLY_FAST_S = 30          # 招呼发出后这么快就来了一大段 = 自动回复
+AUTO_REPLY_FAST_MIN_LEN = 80    # 真人秒回一般很短 ("Hi who is this?"), 自动回复实测最短 114
+# 开头套话: 只收商家模板才会这么开头的 ("Thank you for reaching out" 真人也常说, 不收)
+_AUTO_REPLY_START_RE = re.compile(
+    r"^\W*(thank(s| you)( so much)? for (contacting|choosing)\b|welcome to\b|hello,? (and )?welcome to\b|"
+    r"شكر[اً]* (لك|لكم) (على|ل)\s*(تواصل|اتصال)|شكرا لتواصلك|أهلا[ًو]? (بكم|بك) في|مرحب[اًا]* بكم في|"
+    r"感谢(您|你)的?(联系|来信|咨询)|欢迎(来到|光临)|"
+    r"cảm ơn (bạn|quý khách|anh/chị) đã liên hệ|chào mừng (bạn|quý khách) đến)", re.I)
+# 句中字眼: "现在不在 / 营业时间 / 自动回复"
+_AUTO_REPLY_ANY_RE = re.compile(
+    r"we('re| are) (currently )?(unavailable|closed|away|out of)|unavailable (right )?now|"
+    r"\bauto(mated|matic)?[- ]?(reply|response|message)\b|out of (the )?office|(business|office|working) hours|"
+    r"自动回复|不在线|营业时间|tin nhắn tự động|giờ làm việc|رد آلي|ساعات العمل", re.I)
+_AUTO_REPLY_MIN_LEN = 40
+
+
+def _auto_reply_reason(platform: str, history: list[dict]) -> str | None:
+    """history 已含对方这条。只判对方对招呼的第一条回复 (之前没有 them)。"""
+    if platform not in OUTREACH or not history or history[-1].get("r") != "them":
+        return None
+    prior = history[:-1]
+    if any(h.get("r") == "them" for h in prior):
+        return None
+    text = history[-1].get("t", "").strip()
+    last_us = next((h for h in reversed(prior) if h.get("r") == "us" and h.get("at")), None)
+    if last_us and len(text) >= AUTO_REPLY_FAST_MIN_LEN:
+        try:
+            gap = (datetime.fromisoformat(history[-1]["at"]) - datetime.fromisoformat(last_us["at"])).total_seconds()
+        except (KeyError, ValueError):
+            gap = None
+        if gap is not None and 0 <= gap <= AUTO_REPLY_FAST_S:
+            return f"auto_reply_fast:{int(gap)}s"
+    if len(text) >= _AUTO_REPLY_MIN_LEN and (_AUTO_REPLY_START_RE.search(text) or _AUTO_REPLY_ANY_RE.search(text)):
+        return "auto_reply_phrase"
+    return None
+
+
 _CJK_RE = re.compile(r"[぀-ヿ㐀-鿿가-힯]")
 _ARABIC_RE = re.compile(r"[؀-ۿ]")
 _VI_RE = re.compile(r"[ăâđêôơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹ]", re.I)
@@ -654,7 +694,13 @@ async def _claim_dm(db, device_id, tk, body, row, lead=None) -> ClaimResponse:
     destination = row.destination if row else None
     if not destination and pf not in OUTREACH:          # 招募对话不推产品, 省一次 LLM
         destination = await _destination(_transcript(history))
-    g = await _gen_dm(history, destination, pf, lead.region if lead else None)
+    auto = _auto_reply_reason(pf, history) if not retry else None
+    if auto:
+        # 商家自动回复: 不调 LLM, 不回, 不改线索状态; 原文留在 history 里, 真人后续回复时有上下文
+        log.info("outreach_auto_reply", platform=pf, lead_id=lead_id, why=auto, text=new[:120])
+        g = {"reply": None, "handover": False, "lead_type": None, "opt_out": False, "why": f"llm_skip:{auto}"}
+    else:
+        g = await _gen_dm(history, destination, pf, lead.region if lead else None)
     reply, handover, why, opt_out = g["reply"], g["handover"], g["why"], g["opt_out"]
     lead_type = g["lead_type"] or (row.lead_type if row else None)
     status = "claimed" if reply else ("skipped" if (why or "").startswith("llm_skip") else "failed")
