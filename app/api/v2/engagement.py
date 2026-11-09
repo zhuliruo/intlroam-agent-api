@@ -154,7 +154,7 @@ Customer = them). Write your NEXT message only.
 SKIP (empty reply + skip_reason) when the message is spam/scam, abusive, a sales pitch for
 something else, or clearly an auto-reply (e.g. business away message).
 
-Return JSON only: {{"reply": "...", "handover": false, "lead_type": null, "opt_out": false, "skip_reason": null}}"""
+Return JSON only: {{"reply": "...", "handover": false, "lead_type": null, "opt_out": false, "bot": false, "skip_reason": null}}"""
 
 _COMMENT_TASK = {
     "facebook": {
@@ -293,8 +293,14 @@ def _clean_outreach_text(their_text: str, history: list[dict]) -> str:
 AUTO_REPLY_FAST_S = 30          # 招呼发出后这么快就来了一大段 = 自动回复
 AUTO_REPLY_FAST_MIN_LEN = 80    # 真人秒回一般很短 ("Hi who is this?"), 自动回复实测最短 114
 # 开头套话: 只收商家模板才会这么开头的 ("Thank you for reaching out" 真人也常说, 不收)
+# 11-09: 前面常带一句 "Hi." / "Hello!" / "Dear customer," (Babina-Noko "Hi thank you for contacting…",
+# Irving Knight "Hi. Thank you for your message. How can i assist?") → 允许一个问候前缀;
+# "thank you for your message / for messaging" 是 WhatsApp Business 默认 greeting/away 模板。
+_GREET_PREFIX = r"(?:(?:hi|hello|hey|hii+|good (?:morning|afternoon|day|evening)|dear [\w ]{1,25}?)\W{0,4}\s*)?"
 _AUTO_REPLY_START_RE = re.compile(
-    r"^\W*(thank(s| you)( so much)? for (contacting|choosing)\b|welcome to\b|hello,? (and )?welcome to\b|"
+    r"^\W*" + _GREET_PREFIX +
+    r"(thank(s| you)( so much| very much)? for (contacting|choosing)\b|"
+    r"welcome to\b|hello,? (and )?welcome to\b|"
     r"شكر[اً]* (لك|لكم) (على|ل)\s*(تواصل|اتصال)|شكرا لتواصلك|أهلا[ًو]? (بكم|بك) في|مرحب[اًا]* بكم في|"
     r"感谢(您|你)的?(联系|来信|咨询)|欢迎(来到|光临)|"
     r"cảm ơn (bạn|quý khách|anh/chị) đã liên hệ|chào mừng (bạn|quý khách) đến)", re.I)
@@ -322,9 +328,34 @@ def _auto_reply_reason(platform: str, history: list[dict]) -> str | None:
             gap = None
         if gap is not None and 0 <= gap <= AUTO_REPLY_FAST_S:
             return f"auto_reply_fast:{int(gap)}s"
-    if len(text) >= _AUTO_REPLY_MIN_LEN and (_AUTO_REPLY_START_RE.search(text) or _AUTO_REPLY_ANY_RE.search(text)):
+    if _looks_auto(text):
         return "auto_reply_phrase"
     return None
+
+
+# 弱开头 "Thanks for your message / for messaging": 真人也会这么说 ("thanks for your message, yes interested"),
+# 所以必须再带一句客服模板腔才算自动回复
+_AUTO_REPLY_WEAK_START_RE = re.compile(
+    r"^\W*" + _GREET_PREFIX + r"thank(s| you)( so much| very much)? for (your (message|inquiry|enquiry)|messaging)\b", re.I)
+_AUTO_REPLY_TEMPLATE_RE = re.compile(
+    r"how (can|may) (i|we) (help|assist|serve)|(will|shall) (get back|respond|reply|revert)|as soon as possible|"
+    r"kindly (write|send|provide|share)|for (any|all) (enquiries|inquiries|questions)|kindest regards|best regards", re.I)
+
+
+def _looks_auto(text: str) -> bool:
+    text = (text or "").strip()
+    if len(text) < _AUTO_REPLY_MIN_LEN:
+        return False
+    if _AUTO_REPLY_START_RE.search(text) or _AUTO_REPLY_ANY_RE.search(text):
+        return True
+    return bool(_AUTO_REPLY_WEAK_START_RE.search(text) and _AUTO_REPLY_TEMPLATE_RE.search(text))
+
+
+def _has_auto_responder(history: list[dict]) -> bool:
+    """对方第一条回复就是商家自动回复 = 这个号挂着自动应答 (可能还是 AI 客服)。
+    新数据看 history 里的 auto 标记; 11-09 之前的老会话用套话再认一次。"""
+    first = next((h for h in history if h.get("r") == "them"), None)
+    return bool(first and (first.get("auto") or _looks_auto(first.get("t", ""))))
 
 
 _CJK_RE = re.compile(r"[぀-ヿ㐀-鿿가-힯]")
@@ -419,6 +450,17 @@ def _transcript(history: list[dict]) -> str:
                      for h in history[-HISTORY_KEEP:])
 
 
+# 只在"对方第一条回复就是商家自动回复"的会话里加: 这类号常挂着 AI 客服, 回得像真人但不是老板本人
+_BOT_CHECK = """AUTOMATION CHECK: this business answered your greeting with an automatic
+template, so their WhatsApp has an auto-responder that may be an AI assistant. Also return
+"bot": true if their LATEST message reads like an automated/AI assistant rather than the owner
+typing: polished generic customer-service tone, thanks you for "reaching out" / "considering us",
+repeats your offer back to you, asks for a structured list of details (model, commission,
+process, requirements…), or signs off as the company/team. Real people write shorter and
+more casually. When "bot" is true: do NOT hand over; reply in 1-2 sentences with the brochure
+link ({brochure}) and ask them to pass it to the owner or manager, who can message you here.
+Otherwise "bot": false."""
+
 _LEAD_TYPES = ("reseller", "customer")
 
 
@@ -431,10 +473,12 @@ async def _gen_dm(history: list[dict], destination: str | None,
         brochure = brochure_url(platform, region)
         vi = platform == "zalo" or region == "VN"
         lang = _outreach_language(platform, region, history)
+        auto_responder = _has_auto_responder(history[:-1])
         system = "\n\n".join([_OUTREACH_PERSONA, _OUTREACH_TASK.format(chat=_CHAT[platform]),
                               _RULES.format(length="1-3 short sentences, under 350 characters (plus the link if sent)"),
                               _RESELLER_FACTS.format(prices=price_lines(vi), brochure=brochure),
-                              f"LANGUAGE: write your reply in {lang}. This overrides every other language rule."])
+                              f"LANGUAGE: write your reply in {lang}. This overrides every other language rule."]
+                             + ([_BOT_CHECK.format(brochure=brochure)] if auto_responder else []))
         allowed = None
     else:
         facts, allowed = await _facts(destination, full=True)
@@ -455,8 +499,17 @@ async def _gen_dm(history: list[dict], destination: str | None,
     out["opt_out"] = bool(d.get("opt_out")) and platform in OUTREACH
     reply = str(d.get("reply") or "").strip()
     if not reply:
+        # 11-09: LLM 判 skip (自动回复/垃圾) 时偶尔还带 handover=true —— skip 了就不该转人工
+        out["handover"] = False
         out["why"] = f"llm_skip:{d.get('skip_reason') or 'unspecified'}"
         return out
+    if platform in OUTREACH and auto_responder and bool(d.get("bot")):
+        # 11-09 Vumbulia (+254): 先来一条商家模板, 次日又来一段"感谢考虑合作, 请介绍佣金结构…"的 AI 客服腔
+        # → 这家挂着 AI 应答, 不转人工; 回一句带介绍材料、请转给老板。真人后续再回会正常判断。
+        log.info("outreach_bot_suspected", reply=reply[:160])
+        out["handover"] = False
+        out["lead_type"] = None
+        out["why"] = "bot_suspected"
     if len(reply) > 500:
         out["why"] = "too_long"
         return out
@@ -575,6 +628,8 @@ async def _claim(body: ClaimRequest, device_id: str, db, rds) -> ClaimResponse:
     if body.platform in OUTREACH and lead is None and (row is None or row.lead_id is None):
         # WhatsApp/Zalo 上不是我们打过招呼的人 (可能是机主的私人联系人) —— 绝不自动回
         await db.rollback()
+        log.info("engagement_skip", device_id=device_id, platform=body.platform, reason="not_a_lead",
+                 counterpart=(body.counterpart or "")[:60], phone=bool(body.phone))
         return ClaimResponse(action="skip", reason="not_a_lead")
     if kind == "dm":
         resp = await _claim_dm(db, device_id, tk, body, row, lead)
@@ -650,6 +705,7 @@ async def _claim_dm(db, device_id, tk, body, row, lead=None) -> ClaimResponse:
         if not cleaned:
             # 只是给我们的消息点了表情 / 撤回了消息: 不算回复, 不调 LLM, 不转人工, 不改线索状态
             await db.rollback()
+            log.info("engagement_skip", device_id=device_id, platform=pf, reason="reaction_only", lead_id=lead_id)
             return ClaimResponse(action="skip", id=row.id if row else None, reason="reaction_only")
         body = body.model_copy(update={"their_text": cleaned})
     if row and row.handover:
@@ -664,6 +720,7 @@ async def _claim_dm(db, device_id, tk, body, row, lead=None) -> ClaimResponse:
             await chatwoot_notify.forward(row.chatwoot_conversation_id, new)
         else:
             await db.rollback()
+        log.info("engagement_skip", device_id=device_id, platform=pf, reason="handover", id=row.id, forwarded=bool(new))
         return ClaimResponse(action="skip", id=row.id, reason="handover")
     if row and row.turns >= MAX_TURNS_BY_PLATFORM.get(pf, MAX_DM_TURNS):
         # 聊到上限还在问 → 转人工 (进日报 + Chatwoot), 不再自动回
@@ -687,6 +744,7 @@ async def _claim_dm(db, device_id, tk, body, row, lead=None) -> ClaimResponse:
             retry = True
         else:
             await db.rollback()
+            log.info("engagement_skip", device_id=device_id, platform=pf, reason="duplicate", id=row.id if row else None)
             return ClaimResponse(action="skip", id=row.id if row else None, reason="duplicate")
     if not retry:
         history.append({"r": "them", "t": new[:1500], "at": _now_iso()})
@@ -698,6 +756,7 @@ async def _claim_dm(db, device_id, tk, body, row, lead=None) -> ClaimResponse:
     if auto:
         # 商家自动回复: 不调 LLM, 不回, 不改线索状态; 原文留在 history 里, 真人后续回复时有上下文
         log.info("outreach_auto_reply", platform=pf, lead_id=lead_id, why=auto, text=new[:120])
+        history[-1]["auto"] = auto            # 之后据此认出"这家挂着自动应答/AI 客服"
         g = {"reply": None, "handover": False, "lead_type": None, "opt_out": False, "why": f"llm_skip:{auto}"}
     else:
         g = await _gen_dm(history, destination, pf, lead.region if lead else None)
