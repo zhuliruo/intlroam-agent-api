@@ -28,13 +28,22 @@ BROCHURES = {
 }
 _ARABIC_REGIONS = {"OM", "AE", "SA", "QA", "BH", "KW", "JO", "EG", "MA"}
 
+# 11-09 用户: 除了介绍材料, 也引导对方去 eSIMHub 注册 (邮箱验证即激活), 登录后看全部产品和自己等级的价格
+SIGNUP_BASE = "https://esimhub.link/{lang}/register"
+
+
+def _lang(platform: str, region: str | None) -> str:
+    if platform == "zalo" or region == "VN":
+        return "vi"
+    return "ar" if region in _ARABIC_REGIONS else "en"
+
+
+def signup_url(platform: str, region: str | None) -> str:
+    return SIGNUP_BASE.format(lang=_lang(platform, region)) + f"?utm_source=agent&utm_medium={platform}"
+
 
 def brochure_url(platform: str, region: str | None) -> str:
-    if platform == "zalo" or region == "VN":
-        return BROCHURES["vi"]
-    if region in _ARABIC_REGIONS:
-        return BROCHURES["ar"]
-    return BROCHURES["en"]
+    return BROCHURES[_lang(platform, region)]
 
 
 def price_lines(vietnamese: bool) -> str:
@@ -58,10 +67,19 @@ def prices_ok(msg: str) -> bool:
     return True
 
 
-def strip_links_except(msg: str, allowed: str) -> str:
-    """去掉所有链接, 介绍材料链接除外。"""
+def strip_links_except(msg: str, allowed: str | list[str]) -> str:
+    """去掉所有链接, 给定的链接 (介绍材料 / eSIMHub 注册页) 除外。"""
+    ok = {allowed} if isinstance(allowed, str) else set(allowed)
+
+    bases = {re.sub(r"^https?://", "", a.split("?")[0]).rstrip("/").lower(): a for a in ok}
+
     def sub(m):
         u = m.group(0).rstrip(".,)")
-        return m.group(0) if (u == allowed or u.lower() in ("intlroam.com", "www.intlroam.com")) else ""
+        tail = m.group(0)[len(u):]
+        if u in ok or u.lower() in ("intlroam.com", "www.intlroam.com"):
+            return m.group(0)
+        # LLM 常把 ?utm_… 吞掉或去掉 https:// → 认出是哪条允许的链接就换回标准写法
+        base = re.sub(r"^https?://", "", u.split("?")[0]).rstrip("/").lower()
+        return bases[base] + tail if base in bases else ""
     out = re.sub(r"https?://\S+|www\.\S+|\b[\w-]+\.(?:com|link|net)\b\S*", sub, msg)
     return re.sub(r"\s{2,}", " ", out).strip()

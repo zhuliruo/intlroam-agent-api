@@ -38,7 +38,7 @@ from app.deps import get_db, get_device_id, get_redis
 from app.services import chatwoot_notify
 from app.services.country_promo import _clean_plan_name, _products, featured_for_country
 from app.services.llm_client import call_llm
-from app.services.partner_offer import BROCHURES, brochure_url, price_lines, prices_ok, strip_links_except
+from app.services.partner_offer import BROCHURES, brochure_url, price_lines, prices_ok, signup_url, strip_links_except
 from app.services.phone_leads import TABLE as LEAD_TABLE
 from app.utils.logger import get_logger
 
@@ -128,19 +128,25 @@ _RESELLER_FACTS = """RESELLER FACTS (these are your PRODUCT FACTS — the only t
 - Full price list, commission/discount levels and sign-up: a colleague sends them personally.
   NEVER invent any other price, discount, percentage or commission.
 - Partner brochure (PDF): {brochure}
-  Send this link when they ask for materials / a catalogue / more info / details in writing."""
+  Send this link when they ask for materials / a catalogue / more info / details in writing.
+- Partner portal sign-up (free, email verification only): {signup}
+  After registering they can log in and see ALL products and their partner prices, and order
+  or top up by themselves. Send this link when they ask for prices / the full product list /
+  how to start or sign up, or say they are interested."""
 
 _OUTREACH_TASK = """This is a {chat} chat. You messaged them first (your greeting is the first
 "You" line) to invite them to become a part-time reseller. Conversation below (You = you,
 Customer = them). Write your NEXT message only.
 - Reply in the language they use. 1-2 short sentences. Friendly, no pressure. The ONLY link
-  you may ever send is the partner brochure link from RESELLER FACTS.
+  links you may ever send are the brochure link and the sign-up link from RESELLER FACTS
+  (copy them exactly; send each at most once in the chat unless they ask again).
 - Answer briefly from RESELLER FACTS; if they ask something not covered, say a colleague will
   explain and hand over.
-- If they ask for materials / brochure / catalogue / price list, send the brochure link
-  (one short line around it).
+- If they ask for materials / brochure / catalogue, send the brochure link; if they ask for
+  prices / the full product list / how to start, send the sign-up link and say they can see all
+  products and partner prices after registering (one short line around each link).
 - Set "handover": true (and say a colleague will contact them shortly with the details; if
-  you haven't sent the brochure yet, add its link) only when their OWN WORDS show interest:
+  you haven't sent them yet, add the brochure and sign-up links) only when their OWN WORDS show interest:
   they ask for details / prices / commission / how to start / to try, say yes / interested,
   OR they want to buy eSIMs for themselves, OR they ask for a call or a real person.
 - NOT interest (no handover): an emoji, a sticker, a photo, "ok", "thanks", "hi", "who is
@@ -154,7 +160,7 @@ Customer = them). Write your NEXT message only.
 SKIP (empty reply + skip_reason) when the message is spam/scam, abusive, a sales pitch for
 something else, or clearly an auto-reply (e.g. business away message).
 
-Return JSON only: {{"reply": "...", "handover": false, "lead_type": null, "opt_out": false, "bot": false, "skip_reason": null}}"""
+Return JSON only: {{"reply": "...", "handover": false, "lead_type": null, "opt_out": false, "skip_reason": null}}"""
 
 _COMMENT_TASK = {
     "facebook": {
@@ -351,13 +357,6 @@ def _looks_auto(text: str) -> bool:
     return bool(_AUTO_REPLY_WEAK_START_RE.search(text) and _AUTO_REPLY_TEMPLATE_RE.search(text))
 
 
-def _has_auto_responder(history: list[dict]) -> bool:
-    """对方第一条回复就是商家自动回复 = 这个号挂着自动应答 (可能还是 AI 客服)。
-    新数据看 history 里的 auto 标记; 11-09 之前的老会话用套话再认一次。"""
-    first = next((h for h in history if h.get("r") == "them"), None)
-    return bool(first and (first.get("auto") or _looks_auto(first.get("t", ""))))
-
-
 _CJK_RE = re.compile(r"[぀-ヿ㐀-鿿가-힯]")
 _ARABIC_RE = re.compile(r"[؀-ۿ]")
 _VI_RE = re.compile(r"[ăâđêôơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹ]", re.I)
@@ -450,17 +449,6 @@ def _transcript(history: list[dict]) -> str:
                      for h in history[-HISTORY_KEEP:])
 
 
-# 只在"对方第一条回复就是商家自动回复"的会话里加: 这类号常挂着 AI 客服, 回得像真人但不是老板本人
-_BOT_CHECK = """AUTOMATION CHECK: this business answered your greeting with an automatic
-template, so their WhatsApp has an auto-responder that may be an AI assistant. Also return
-"bot": true if their LATEST message reads like an automated/AI assistant rather than the owner
-typing: polished generic customer-service tone, thanks you for "reaching out" / "considering us",
-repeats your offer back to you, asks for a structured list of details (model, commission,
-process, requirements…), or signs off as the company/team. Real people write shorter and
-more casually. When "bot" is true: do NOT hand over; reply in 1-2 sentences with the brochure
-link ({brochure}) and ask them to pass it to the owner or manager, who can message you here.
-Otherwise "bot": false."""
-
 _LEAD_TYPES = ("reseller", "customer")
 
 
@@ -471,14 +459,13 @@ async def _gen_dm(history: list[dict], destination: str | None,
     if platform in OUTREACH:
         # 招募分销商的对话: 不报价、不发产品链接 (人工接手后再给), 只用分销事实
         brochure = brochure_url(platform, region)
+        signup = signup_url(platform, region)
         vi = platform == "zalo" or region == "VN"
         lang = _outreach_language(platform, region, history)
-        auto_responder = _has_auto_responder(history[:-1])
         system = "\n\n".join([_OUTREACH_PERSONA, _OUTREACH_TASK.format(chat=_CHAT[platform]),
                               _RULES.format(length="1-3 short sentences, under 350 characters (plus the link if sent)"),
-                              _RESELLER_FACTS.format(prices=price_lines(vi), brochure=brochure),
-                              f"LANGUAGE: write your reply in {lang}. This overrides every other language rule."]
-                             + ([_BOT_CHECK.format(brochure=brochure)] if auto_responder else []))
+                              _RESELLER_FACTS.format(prices=price_lines(vi), brochure=brochure, signup=signup),
+                              f"LANGUAGE: write your reply in {lang}. This overrides every other language rule."])
         allowed = None
     else:
         facts, allowed = await _facts(destination, full=True)
@@ -503,19 +490,12 @@ async def _gen_dm(history: list[dict], destination: str | None,
         out["handover"] = False
         out["why"] = f"llm_skip:{d.get('skip_reason') or 'unspecified'}"
         return out
-    if platform in OUTREACH and auto_responder and bool(d.get("bot")):
-        # 11-09 Vumbulia (+254): 先来一条商家模板, 次日又来一段"感谢考虑合作, 请介绍佣金结构…"的 AI 客服腔
-        # → 这家挂着 AI 应答, 不转人工; 回一句带介绍材料、请转给老板。真人后续再回会正常判断。
-        log.info("outreach_bot_suspected", reply=reply[:160])
-        out["handover"] = False
-        out["lead_type"] = None
-        out["why"] = "bot_suspected"
     if len(reply) > 500:
         out["why"] = "too_long"
         return out
     if platform in OUTREACH:
         # 招募对话: 只许介绍材料链接; 金额只许是给定例子价, 编了就当失败 (下一条消息会重试)
-        reply = strip_links_except(reply, brochure)
+        reply = strip_links_except(reply, [brochure, signup])
         if not reply or not prices_ok(reply):
             log.info("outreach_reply_rejected", reply=(reply or "")[:200])
             out["why"] = "bad_price"
