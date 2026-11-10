@@ -344,6 +344,7 @@ def collect(cur, since: datetime, until: datetime) -> dict:
                    count(*) FILTER (WHERE status = 'sent' AND brand) AS branded
             FROM fb_engagements
             WHERE created_at >= %s AND created_at < %s
+              AND platform NOT IN ('whatsapp', 'zalo')
             GROUP BY 1
         """, w)
         # 私信: 自动回过第一句, 待人工接手 (不限窗口 —— 没处理完的一直挂着, 最多 7 天)
@@ -353,6 +354,7 @@ def collect(cur, since: datetime, until: datetime) -> dict:
                    coalesce(sent_at, updated_at), turns, coalesce(destination, '')
             FROM fb_engagements
             WHERE kind = 'dm' AND handover AND human_status = 'pending'
+              AND platform NOT IN ('whatsapp', 'zalo')
               AND updated_at >= now() - interval '7 days'
             ORDER BY updated_at DESC LIMIT 40
         """)
@@ -360,12 +362,110 @@ def collect(cur, since: datetime, until: datetime) -> dict:
             SELECT count(*), coalesce(sum(turns), 0)
             FROM fb_engagements
             WHERE kind = 'dm' AND updated_at >= %s AND updated_at < %s
+              AND platform NOT IN ('whatsapp', 'zalo')
         """, w)[0]
     except Exception:
         cur.connection.rollback()
         d["engage"], d["engage_dms"], d["engage_dm_convos"] = [], [], (0, 0)
 
+    d["outreach"] = collect_outreach(cur, since, until)
     return d
+
+
+# ── WhatsApp / Zalo 打招呼找分销商 (2026-11-10 加进日报) ──
+# 号码池: phone_leads_vn (Zalo) / phone_leads_intl (WhatsApp)
+#   status: new → assigned → greeted / not_on_app / already_contacted / failed
+#           greeted 之后: replied / handover (转人工, 已开 Chatwoot) / opted_out
+#   普通失败 (打不开/找不到按钮) 会放回 new 重试 (最多 3 次), failure_reason 留着
+# 对话在 fb_engagements (platform = whatsapp|zalo, lead_id 关联), history 里每条带时间:
+#   第 1 条 r=us 是招呼, 之后 r=them 是对方, r=us 是自动回复 (发送成功才写进去)
+# 转人工/拒绝之后不再改线索行, 所以线索行的 updated_at 就是转人工/拒绝的时间。
+OUTREACH_LEADS_SQL = """
+    SELECT 'whatsapp' AS ch, * FROM phone_leads_intl
+    UNION ALL
+    SELECT 'zalo' AS ch, * FROM phone_leads_vn
+"""
+CHATWOOT_CONV_URL = "https://chat.intlroam.com/app/accounts/1/conversations/{}"
+
+
+def collect_outreach(cur, since: datetime, until: datetime) -> dict:
+    w = (since, until)
+    o: dict = {"ok": False}
+    try:
+        # 每台机 × 渠道: 招呼成功 / 号码没开通 / 以前聊过(跳过) / 其他失败
+        o["greet"] = q(cur, f"""
+            SELECT coalesce(assigned_device, '?'), ch,
+                   count(*) FILTER (WHERE greeted_at >= %s AND greeted_at < %s) AS greeted,
+                   count(*) FILTER (WHERE status = 'not_on_app'
+                                    AND updated_at >= %s AND updated_at < %s) AS not_on_app,
+                   count(*) FILTER (WHERE status = 'already_contacted'
+                                    AND updated_at >= %s AND updated_at < %s) AS already,
+                   count(*) FILTER (WHERE (status = 'failed' OR (status IN ('new', 'assigned')
+                                           AND failure_reason IS NOT NULL))
+                                    AND updated_at >= %s AND updated_at < %s) AS failed
+            FROM ({OUTREACH_LEADS_SQL}) l
+            WHERE (greeted_at >= %s AND greeted_at < %s) OR (updated_at >= %s AND updated_at < %s)
+            GROUP BY 1, 2
+        """, w * 6)
+        # 对话: 当天回了我们的人数 / 当天我们发出的自动回复条数 (不含招呼)
+        o["chat"] = q(cur, """
+            SELECT e.device_id, e.platform,
+                   count(DISTINCT e.id) FILTER (WHERE h.v->>'r' = 'them') AS replied_people,
+                   count(*) FILTER (WHERE h.v->>'r' = 'us' AND h.n > 1)   AS auto_replies
+            FROM fb_engagements e
+            CROSS JOIN LATERAL jsonb_array_elements(e.history) WITH ORDINALITY AS h(v, n)
+            WHERE e.platform IN ('whatsapp', 'zalo')
+              AND jsonb_typeof(e.history) = 'array'
+              AND (h.v->>'at') IS NOT NULL
+              AND (h.v->>'at')::timestamptz >= %s AND (h.v->>'at')::timestamptz < %s
+            GROUP BY 1, 2
+        """, w)
+        # 商家自动回复 (没调 LLM, 不算真人回复) —— 当天被识别出来的会话数
+        o["auto_skipped"] = dict(q(cur, """
+            SELECT platform, count(*) FROM fb_engagements
+            WHERE platform IN ('whatsapp', 'zalo') AND failure_reason LIKE 'llm_skip:auto_reply%%'
+              AND updated_at >= %s AND updated_at < %s
+            GROUP BY 1
+        """, w))
+        # 当天转人工 / 拒绝 (线索行在转人工/拒绝后不再变, updated_at 即发生时间)
+        o["outcomes"] = q(cur, f"""
+            SELECT ch,
+                   count(*) FILTER (WHERE status = 'handover')  AS handover,
+                   count(*) FILTER (WHERE status = 'opted_out') AS opted_out
+            FROM ({OUTREACH_LEADS_SQL}) l
+            WHERE updated_at >= %s AND updated_at < %s
+            GROUP BY 1
+        """, w)
+        # 当天转人工的名单 (Chatwoot 里接手)
+        o["handovers"] = q(cur, f"""
+            SELECT l.ch, l.phone_e164, coalesce(nullif(e.counterpart, ''), l.display_name, l.phone_e164),
+                   coalesce(e.lead_type, ''), left(coalesce(e.their_text, ''), 200),
+                   e.chatwoot_conversation_id, l.updated_at, coalesce(l.source_author, ''),
+                   coalesce(e.human_status, '')
+            FROM ({OUTREACH_LEADS_SQL}) l
+            LEFT JOIN LATERAL (
+                SELECT * FROM fb_engagements e
+                WHERE e.platform = l.ch AND e.lead_id = l.id
+                ORDER BY e.updated_at DESC LIMIT 1) e ON true
+            WHERE l.status = 'handover' AND l.updated_at >= %s AND l.updated_at < %s
+            ORDER BY l.updated_at
+        """, w)
+        # 号码池 (当下快照) + 当天新采集
+        o["pool"] = q(cur, f"""
+            SELECT ch,
+                   count(*) FILTER (WHERE status = 'new')                          AS waiting,
+                   count(*) FILTER (WHERE created_at >= %s AND created_at < %s)    AS collected,
+                   count(*) FILTER (WHERE greeted_at IS NOT NULL)                  AS greeted_all,
+                   count(*) FILTER (WHERE status IN ('replied', 'handover', 'opted_out')) AS replied_all,
+                   count(*) FILTER (WHERE status = 'handover')                     AS handover_all
+            FROM ({OUTREACH_LEADS_SQL}) l
+            GROUP BY 1
+        """, w)
+        o["ok"] = True
+    except Exception as e:
+        cur.connection.rollback()
+        o["error"] = str(e)[:200]
+    return o
 
 
 # ────────────────────────────────────────────────────────────────
@@ -538,6 +638,7 @@ def render(d: dict, since: datetime, until: datetime, warnings: list) -> str:
     v_total = sum(r[2] for r in d["visits"])
 
     prev_ok, prev_shadow = d["prev_comments"]
+    ot = outreach_totals(d)
     brand_pct = f"{c_branded / c_ok:.0%}" if c_ok else "—"
     shadow_pct = f"{c_shadow / (c_ok + c_fail):.1%}" if (c_ok + c_fail) else "—"
     abort_pct = f"{v_abort / v_total:.0%}" if v_total else "—"
@@ -558,7 +659,10 @@ def render(d: dict, since: datetime, until: datetime, warnings: list) -> str:
                     label="空跑访问", value=v_abort,
                     sub=f"占群访问 {abort_pct}") +
         CARD.format(bg="#f8fafc", bd="#e5e7eb", fg="#374151", label="品牌提及率",
-                    value=brand_pct, sub=f"{c_branded}/{c_ok} 条 · {_brand_sub(d)}")
+                    value=brand_pct, sub=f"{c_branded}/{c_ok} 条 · {_brand_sub(d)}") +
+        CARD.format(bg="#f0fdfa", bd="#99f6e4", fg="#0d9488", label="WhatsApp/Zalo 招呼",
+                    value=ot["greeted"],
+                    sub=f"回复 {ot['replied']} 人 · 转人工 {ot['handover']} · 拒绝 {ot['opted_out']}")
     )
 
     # ── 警告区 ──
@@ -794,6 +898,8 @@ def render(d: dict, since: datetime, until: datetime, warnings: list) -> str:
             + dm_rows + "</table>") if dm_rows else "")
     )
 
+    outreach_html = render_outreach(d)
+
     return (
         "<html><body style='margin:0;padding:0;background:#f1f5f9;"
         "font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,sans-serif;'>"
@@ -806,15 +912,135 @@ def render(d: dict, since: datetime, until: datetime, warnings: list) -> str:
         "<div style='padding:28px 40px;'>"
         "<div style='display:flex;gap:12px;margin-bottom:8px;flex-wrap:wrap;'>"
         + cards + "</div>"
-        + warn_html + leads_html + engage_html + matrix_html + funnel_html + fail_html +
+        + warn_html + outreach_html + leads_html + engage_html + matrix_html + funnel_html + fail_html +
         "</div>"
         "<div style='background:#f8fafc;padding:18px 40px;text-align:center;"
         "border-top:1px solid #e5e7eb;'>"
         "<p style='color:#9ca3af;font-size:11px;margin:0;'>"
         "intlroam-api @ HK · 数据源 comment_attempts / device_post_history / "
-        "device_group_visits / raw_posts</p>"
+        "device_group_visits / raw_posts / phone_leads_* / fb_engagements</p>"
         "</div></div></body></html>"
     )
+
+
+_CH_CN = {"whatsapp": "WhatsApp", "zalo": "Zalo"}
+_LEAD_CN = {"reseller": "想做分销", "customer": "想购买"}
+
+
+def outreach_totals(d: dict) -> dict:
+    o = d.get("outreach") or {}
+    t = {"greeted": 0, "replied": 0, "handover": 0, "opted_out": 0}
+    if not o.get("ok"):
+        return t
+    t["greeted"] = sum(r[2] for r in o["greet"])
+    t["replied"] = sum(r[2] for r in o["chat"])
+    t["handover"] = sum(r[1] for r in o["outcomes"])
+    t["opted_out"] = sum(r[2] for r in o["outcomes"])
+    return t
+
+
+def _dev_label(names: dict, dev: str) -> str:
+    if dev == "?":
+        return "待重试(已放回池子)"
+    n = names.get(dev) or dev
+    return _esc(dev[:8] if n == dev else n)
+
+
+def render_outreach(d: dict) -> str:
+    o = d.get("outreach") or {}
+    head = ("<h2 style='font-size:15px;color:#0f172a;margin:26px 0 6px;'>📞 WhatsApp / Zalo 招募分销商"
+            "<span style='font-weight:400;color:#94a3b8;font-size:12px;'>"
+            "（越南号走 Zalo，其他国家走 WhatsApp）</span></h2>")
+    if not o.get("ok"):
+        return head + ("<p style='color:#dc2626;font-size:12px;margin:0;'>取数失败："
+                       + _esc(o.get("error", "未知")) + "</p>")
+    names = d["names"]
+
+    # 渠道汇总
+    per: dict[str, dict] = {ch: {} for ch in ("whatsapp", "zalo")}
+    for dev, ch, greeted, noapp, already, failed in o["greet"]:
+        c = per.setdefault(ch, {})
+        for k, v in (("greeted", greeted), ("noapp", noapp), ("already", already), ("failed", failed)):
+            c[k] = c.get(k, 0) + v
+    for dev, ch, people, autos in o["chat"]:
+        c = per.setdefault(ch, {})
+        c["replied"] = c.get("replied", 0) + people
+        c["autos"] = c.get("autos", 0) + autos
+    for ch, ho, oo in o["outcomes"]:
+        per.setdefault(ch, {}).update(handover=ho, opted_out=oo)
+    pool = {r[0]: r[1:] for r in o["pool"]}
+
+    rows = ""
+    for ch in ("whatsapp", "zalo"):
+        c = per.get(ch, {})
+        waiting, collected, g_all, r_all, h_all = pool.get(ch, (0, 0, 0, 0, 0))
+        rate_all = f"{r_all / g_all:.0%}" if g_all else "—"
+        cells = [
+            ("left", "#111827", "<b>" + _CH_CN[ch] + "</b>"),
+            ("right", "#16a34a", c.get("greeted", 0)),
+            ("right", "#9ca3af", c.get("noapp", 0)),
+            ("right", "#9ca3af", c.get("already", 0)),
+            ("right", "#dc2626" if c.get("failed") else "#9ca3af", c.get("failed", 0)),
+            ("right", "#2563eb", c.get("replied", 0)),
+            ("right", "#6b7280", c.get("autos", 0)),
+            ("right", "#b45309" if c.get("handover") else "#9ca3af", c.get("handover", 0)),
+            ("right", "#6b7280", c.get("opted_out", 0)),
+            ("right", "#6b7280", f"{collected} / {waiting}"),
+            ("right", "#374151", f"{g_all} · {rate_all} · {h_all}"),
+        ]
+        rows += "<tr>" + "".join(TD.format(align=a, color=col, v=v) for a, col, v in cells) + "</tr>"
+    heads = [("left", "渠道"), ("right", "招呼✓"), ("right", "没开通"), ("right", "聊过跳过"),
+             ("right", "失败"), ("right", "回复人数"), ("right", "自动回复"), ("right", "转人工"),
+             ("right", "拒绝"), ("right", "新采号码/当前待打"), ("right", "累计 招呼·回复率·转人工")]
+    table = ("<table width='100%' style='border-collapse:collapse;'><thead><tr style='background:#f8fafc;'>"
+             + "".join(TH.format(align=a, t=t) for a, t in heads) + "</tr></thead><tbody>"
+             + rows + "</tbody></table>")
+
+    auto = o.get("auto_skipped") or {}
+    note = ("<p style='color:#94a3b8;font-size:11px;margin:6px 0 0;'>回复人数 = 当天发来消息的人（含商家自动回复、"
+            "表情回应不算）；自动回复 = agent 发出的后续消息，不含招呼。")
+    if auto:
+        note += " 当天识别为商家自动回复、未作答的会话：" + " · ".join(
+            f"{_CH_CN.get(k, k)} {v}" for k, v in auto.items()) + "。"
+    note += "</p>"
+
+    # 每台机
+    by_dev: dict[tuple[str, str], list[int]] = {}
+    for dev, ch, greeted, noapp, already, failed in o["greet"]:
+        by_dev.setdefault((dev, ch), [0, 0, 0, 0])[:2] = [greeted, noapp + already + failed]
+    for dev, ch, people, autos in o["chat"]:
+        by_dev.setdefault((dev, ch), [0, 0, 0, 0])[2:] = [people, autos]
+    dev_line = ""
+    if by_dev:
+        dev_line = ("<p style='color:#475569;font-size:12px;margin:8px 0 0;'>按设备（招呼✓/失败/回复人数/自动回复）："
+                    + " · ".join(f"{_dev_label(names, dev)} {_CH_CN.get(ch, ch)} "
+                                 f"{v[0]}/{v[1]}/{v[2]}/{v[3]}"
+                                 for (dev, ch), v in sorted(by_dev.items())) + "</p>")
+
+    # 当天转人工名单
+    ho_html = ""
+    if o["handovers"]:
+        trs = ""
+        for ch, phone, who, lt, theirs, cid, at, src, hs in o["handovers"]:
+            link = (" · <a href='" + CHATWOOT_CONV_URL.format(cid) + "' style='color:#2563eb;"
+                    "text-decoration:none;'>Chatwoot #" + str(cid) + "</a>") if cid else \
+                   " · <span style='color:#dc2626;'>没开出 Chatwoot 会话</span>"
+            trs += ("<tr style='border-top:1px solid #e5e7eb;'>"
+                    "<td style='padding:8px 10px;vertical-align:top;white-space:nowrap;'><b>" + _esc(who) + "</b><br>"
+                    "<span style='color:#94a3b8;font-size:11px;'>" + _CH_CN.get(ch, ch) + " " + _esc(phone)
+                    + " · " + (at.astimezone(HKT).strftime("%H:%M") if at else "") + link + "</span></td>"
+                    "<td style='padding:8px 10px;vertical-align:top;font-size:12px;color:#b45309;white-space:nowrap;'>"
+                    + _esc(_LEAD_CN.get(lt, lt or "—")) + "</td>"
+                    "<td style='padding:8px 10px;vertical-align:top;color:#334155;font-size:12px;'>" + _esc(theirs)
+                    + ("<br><span style='color:#94a3b8;font-size:11px;'>号码来源：" + _esc(src) + "</span>" if src else "")
+                    + "</td></tr>")
+        ho_html = ("<p style='color:#b45309;font-size:12px;margin:12px 0 6px;'>当天转人工 "
+                   + str(len(o["handovers"])) + " 个，请在 Chatwoot「Agent Leads」收件箱接手：</p>"
+                   "<table style='width:100%;border-collapse:collapse;font-size:12px;'>"
+                   "<tr style='background:#f1f5f9;text-align:left;'><th style='padding:8px 10px;'>对方</th>"
+                   "<th style='padding:8px 10px;'>意向</th><th style='padding:8px 10px;'>对方最后说</th></tr>"
+                   + trs + "</table>")
+    return head + table + note + dev_line + ho_html
 
 
 # ────────────────────────────────────────────────────────────────
@@ -845,6 +1071,10 @@ def main() -> int:
 
     subject = (f"Agent 日报 {since.astimezone(HKT).strftime('%Y-%m-%d')} — "
                f"评论 {c_ok} · 发帖 {p_ok}")
+    ot = outreach_totals(d)
+    subject += f" · WA/Zalo 招呼 {ot['greeted']}"
+    if ot["handover"]:
+        subject += f" · 转人工 {ot['handover']}"
     if c_shadow:
         subject += f" · shadow ban {c_shadow}"
     high = sum(1 for w in warnings if w[0] == "high")
