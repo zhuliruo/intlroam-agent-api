@@ -129,7 +129,8 @@ _RESELLER_FACTS = """RESELLER FACTS (these are your PRODUCT FACTS — the only t
   NEVER invent any other price, discount, percentage or commission.
 - Partner brochure (PDF): {brochure}
   Send this link when they ask for materials / a catalogue / more info / details in writing.
-- Partner portal sign-up (free, email verification only): {signup}
+- Partner portal (free sign-up, email verification only): {signup}
+  Send it EXACTLY as written — the plain homepage, never add a path like /register or any ?parameters.
   After registering they can log in and see ALL products and their partner prices, and order
   or top up by themselves. Send this link when they ask for prices / the full product list /
   how to start or sign up, or say they are interested."""

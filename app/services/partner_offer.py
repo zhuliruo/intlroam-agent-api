@@ -29,7 +29,8 @@ BROCHURES = {
 _ARABIC_REGIONS = {"OM", "AE", "SA", "QA", "BH", "KW", "JO", "EG", "MA"}
 
 # 11-09 用户: 除了介绍材料, 也引导对方去 eSIMHub 注册 (邮箱验证即激活), 登录后看全部产品和自己等级的价格
-SIGNUP_BASE = "https://esimhub.link/{lang}/register"
+# 11-10 用户: 长链接 (语言路径 + utm) 像诈骗链接, 对方不敢点 → 只发最简单的首页地址
+SIGNUP_URL = "https://esimhub.link"
 
 
 def _lang(platform: str, region: str | None) -> str:
@@ -39,7 +40,7 @@ def _lang(platform: str, region: str | None) -> str:
 
 
 def signup_url(platform: str, region: str | None) -> str:
-    return SIGNUP_BASE.format(lang=_lang(platform, region)) + f"?utm_source=agent&utm_medium={platform}"
+    return SIGNUP_URL
 
 
 def brochure_url(platform: str, region: str | None) -> str:
@@ -80,6 +81,10 @@ def strip_links_except(msg: str, allowed: str | list[str]) -> str:
             return m.group(0)
         # LLM 常把 ?utm_… 吞掉或去掉 https:// → 认出是哪条允许的链接就换回标准写法
         base = re.sub(r"^https?://", "", u.split("?")[0]).rstrip("/").lower()
-        return bases[base] + tail if base in bases else ""
+        if base in bases:
+            return bases[base] + tail
+        # 允许的是裸域名 (eSIMHub 首页) 而 LLM 写成了该域名下的长路径 → 换回首页
+        host = base.split("/")[0]
+        return bases[host] + tail if host in bases else ""
     out = re.sub(r"https?://\S+|www\.\S+|\b[\w-]+\.(?:com|link|net)\b\S*", sub, msg)
     return re.sub(r"\s{2,}", " ", out).strip()
