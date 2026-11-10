@@ -159,6 +159,37 @@ async def open_handover(*, platform: str, device_id: str, counterpart: str, phon
         return None
 
 
+async def set_message_status(conversation_id: int, message_id: int, status: str,
+                             error: str | None = None) -> bool:
+    """API 收件箱专用: 把我们代发的那条消息标成 delivered / failed (Chatwoot 界面上显示送达或红色失败)。"""
+    if not enabled():
+        return False
+    body = {"status": status}
+    if error:
+        body["external_error"] = error[:250]
+    try:
+        async with httpx.AsyncClient() as client:
+            await _call(client, "PATCH", f"/conversations/{conversation_id}/messages/{message_id}", json=body)
+        return True
+    except Exception as e:
+        log.warning("chatwoot_status_failed", conversation_id=conversation_id, message_id=message_id, err=str(e)[:200])
+        return False
+
+
+async def note(conversation_id: int, text: str) -> bool:
+    """在会话里加一条私有备注 (只有坐席看得到)。"""
+    if not enabled() or not conversation_id:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            await _call(client, "POST", f"/conversations/{conversation_id}/messages",
+                        json={"content": text[:3000], "message_type": "outgoing", "private": True})
+        return True
+    except Exception as e:
+        log.warning("chatwoot_note_failed", conversation_id=conversation_id, err=str(e)[:200])
+        return False
+
+
 async def forward(conversation_id: int, text: str) -> bool:
     """转人工之后对方又发来的消息 → 追加进同一个会话 (incoming, 会触发未读提醒)。"""
     if not enabled() or not conversation_id or not text.strip():

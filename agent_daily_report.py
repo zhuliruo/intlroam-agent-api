@@ -411,7 +411,8 @@ def collect_outreach(cur, since: datetime, until: datetime) -> dict:
         o["chat"] = q(cur, """
             SELECT e.device_id, e.platform,
                    count(DISTINCT e.id) FILTER (WHERE h.v->>'r' = 'them') AS replied_people,
-                   count(*) FILTER (WHERE h.v->>'r' = 'us' AND h.n > 1)   AS auto_replies
+                   count(*) FILTER (WHERE h.v->>'r' = 'us' AND h.n > 1
+                                    AND coalesce(h.v->>'by', '') <> 'human') AS auto_replies
             FROM fb_engagements e
             CROSS JOIN LATERAL jsonb_array_elements(e.history) WITH ORDINALITY AS h(v, n)
             WHERE e.platform IN ('whatsapp', 'zalo')

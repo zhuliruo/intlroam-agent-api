@@ -101,6 +101,8 @@ from app.api.v2 import engagement as engagement_api
 app.include_router(engagement_api.router, prefix="/api/v2", tags=["engagement"])
 from app.api.v2 import outreach as outreach_api
 app.include_router(outreach_api.router, prefix="/api/v2", tags=["outreach"])
+from app.api.v2 import chatwoot_outbox as chatwoot_outbox_api
+app.include_router(chatwoot_outbox_api.router, prefix="/api/v2", tags=["chatwoot"])
 
 @app.get("/")
 async def root():
