@@ -26,7 +26,9 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.deps import get_db, get_device_id
+import redis.asyncio as redis
+
+from app.deps import get_db, get_device_id, get_redis
 from app.services import chatwoot_notify
 from app.services.phone_leads import TABLE as LEAD_TABLE
 from app.utils.logger import get_logger
@@ -97,7 +99,7 @@ async def _fail_in_chatwoot(conv: int, msg_id: int, reason: str, with_note: bool
 # ─────────────────────────── webhook ───────────────────────────
 
 @router.post("/chatwoot/webhook")
-async def webhook(request: Request, db: AsyncSession = Depends(get_db)):
+async def webhook(request: Request, db: AsyncSession = Depends(get_db), rds: redis.Redis = Depends(get_redis)):
     raw = await request.body()
     if not _sig_ok(raw, request.headers.get("X-Chatwoot-Timestamp"), request.headers.get("X-Chatwoot-Signature")):
         log.warning("chatwoot_webhook_bad_sig", has_ts=bool(request.headers.get("X-Chatwoot-Timestamp")))
@@ -123,6 +125,14 @@ async def webhook(request: Request, db: AsyncSession = Depends(get_db)):
     if not msg_id or not conv:
         return {"ok": False}
     content = (p.get("content") or "").strip()
+    # 11-11: 模型回复同步进 Chatwoot 也是 outgoing (发送人=token 的主人) —— 不是坐席写的, 不能让手机再发一遍
+    if content.startswith(chatwoot_notify.BOT_PREFIX.strip()):
+        return {"ok": True, "skip": "bot_echo"}
+    try:
+        if await rds.delete(chatwoot_notify.echo_key(conv, content)):
+            return {"ok": True, "skip": "bot_echo"}
+    except Exception:
+        pass
 
     row = (await db.execute(text(
         "SELECT id, device_id, platform, counterpart, lead_id FROM fb_engagements "
@@ -234,8 +244,11 @@ async def outbox_result(body: ResultRequest, device_id: str = Depends(get_device
             hist = list(eng.history or [])
             # by=human: 日报的"自动回复"条数要排除它; r=us 让后续清洗认得出对方引用/点赞的是我们的话
             hist.append({"r": "us", "t": row.content[:1500], "at": _now_iso(), "by": "human"})
-            await db.execute(text("UPDATE fb_engagements SET history=CAST(:h AS jsonb), updated_at=now() "
-                                  "WHERE id=:id"), {"h": json.dumps(hist, ensure_ascii=False), "id": row.engagement_id})
+            # 11-11: 坐席亲自回了 = 人工接手。白天模型不再插话 (避免两边同时回), 越南时间 0-8 点模型代回
+            await db.execute(text(
+                "UPDATE fb_engagements SET history=CAST(:h AS jsonb), handover=true, "
+                "human_status=CASE WHEN human_status IN ('pending','done','opted_out') THEN human_status ELSE 'pending' END, "
+                "updated_at=now() WHERE id=:id"), {"h": json.dumps(hist, ensure_ascii=False), "id": row.engagement_id})
         await db.commit()
         await chatwoot_notify.set_message_status(row.conversation_id, row.chatwoot_message_id, "delivered")
     else:

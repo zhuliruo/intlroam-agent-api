@@ -58,6 +58,16 @@ MAX_DM_TURNS = 6          # 一个私信会话最多自动回几条, 之后转�
 # WhatsApp 一部分开场只发 "Hello" (11-07), 介绍要多占一条 → 5
 MAX_TURNS_BY_PLATFORM = {"whatsapp": 5, "zalo": 4}
 MAX_ATTEMPTS = 2          # 同一条消息生成/发送失败最多重试几次
+# 11-11 用户: 越南时间 0:00-8:00 没人值班 → 已转人工 / 坐席接手的会话, 客户来消息由模型代回。
+# 每个会话每晚最多代回几条 (防止和自动应答机器人对聊一夜)
+VNT = timezone(timedelta(hours=7))
+NIGHT_HOURS = (0, 8)
+NIGHT_MAX_REPLIES = 4
+
+
+def _vn_night(now: datetime | None = None) -> bool:
+    h = (now or datetime.now(VNT)).astimezone(VNT).hour
+    return NIGHT_HOURS[0] <= h < NIGHT_HOURS[1]
 HISTORY_KEEP = 16         # 喂给 LLM 的历史条数
 BRAND_RATE = 0.85         # 评论类回复的点名率 (用户要求评论品牌率 ≥80%)
 
@@ -474,9 +484,17 @@ def _transcript(history: list[dict]) -> str:
 
 _LEAD_TYPES = ("reseller", "customer")
 
+_NIGHT_COVER = """NIGHT COVER: a colleague is already personally handling this conversation, but it is
+night now (00:00-08:00 Vietnam time) and they are offline. Read the whole conversation, including what
+the colleague said (they are "You" too), and answer the customer's latest message briefly and helpfully
+from the facts. Do not contradict or repeat what the colleague already said. Do NOT promise new prices,
+discounts, deals or deadlines. If they need something only the colleague can do (a price quote beyond
+the facts, payment, an order/account problem, a call), say the colleague will follow up with them in
+the morning. Do not set "handover" (it is already handed over)."""
+
 
 async def _gen_dm(history: list[dict], destination: str | None,
-                  platform: str = "facebook", region: str | None = None) -> dict:
+                  platform: str = "facebook", region: str | None = None, night: bool = False) -> dict:
     """→ {reply, handover, lead_type, opt_out, why}"""
     out = {"reply": None, "handover": False, "lead_type": None, "opt_out": False, "why": None}
     if platform in OUTREACH:
@@ -499,13 +517,15 @@ async def _gen_dm(history: list[dict], destination: str | None,
                                _DM_TASK.format(chat=_CHAT.get(platform, "private"), brochure=BROCHURES["en"]),
                                _RULES.format(length=_LENGTH["dm"]), facts + note]
                               + ([_TT_DM_NO_LINK] if platform == "tiktok" else []))
+    if night:
+        system += "\n\n" + _NIGHT_COVER
     d = await _llm_json(system, "Conversation:\n" + _transcript(history), 0.6)
     if d is None:
         out["why"] = "llm_failed"
         return out
     lt = str(d.get("lead_type") or "").strip().lower()
     out["lead_type"] = lt if lt in _LEAD_TYPES else None
-    out["handover"] = bool(d.get("handover"))
+    out["handover"] = bool(d.get("handover")) and not night
     out["opt_out"] = bool(d.get("opt_out")) and platform in OUTREACH
     reply = str(d.get("reply") or "").strip()
     if not reply:
@@ -613,8 +633,10 @@ async def _claim(body: ClaimRequest, device_id: str, db, rds) -> ClaimResponse:
         return ClaimResponse(action="skip", reason="bad_platform")
     if body.platform in OUTREACH and kind != "dm":
         return ClaimResponse(action="skip", reason="bad_kind")
-    if not await _cap_ok(rds, device_id, kind, body.platform):
+    capped = not await _cap_ok(rds, device_id, kind, body.platform)
+    if capped and kind != "dm":
         return ClaimResponse(action="skip", reason="daily_cap")
+    # 11-11: 私信到了日回复上限也要往下走 —— 不回, 但客户的话照样同步进 Chatwoot (见 _claim_dm 的 capped)
     lead = None
     if body.platform in OUTREACH:
         lead = await _find_lead(db, device_id, body)
@@ -636,7 +658,7 @@ async def _claim(body: ClaimRequest, device_id: str, db, rds) -> ClaimResponse:
                  counterpart=(body.counterpart or "")[:60], phone=bool(body.phone))
         return ClaimResponse(action="skip", reason="not_a_lead")
     if kind == "dm":
-        resp = await _claim_dm(db, device_id, tk, body, row, lead)
+        resp = await _claim_dm(db, device_id, tk, body, row, lead, rds, capped)
         if resp.action == "reply":
             resp.phone = (lead.phone_e164 if lead else None) or await _lead_phone(db, body.platform, resp.id)
         return resp
@@ -697,7 +719,14 @@ async def _mark_lead(db, platform: str, lead_id: int | None, status: str) -> Non
 
 async def _handover_notify(db, device_id: str, platform: str, rid: int, counterpart: str,
                            lead, lead_type: str | None, reason: str, history: list[dict]) -> None:
-    """转人工 → Chatwoot 开会话。放在 commit 之后调, Chatwoot 慢/挂不影响回复本身。"""
+    """转人工 → Chatwoot 开会话。放在 commit 之后调, Chatwoot 慢/挂不影响回复本身。
+    11-11: 会话多半已经在同步 (open_mirror) → 不另开, 在原会话里备注+指派。"""
+    existing = (await db.execute(text("SELECT chatwoot_conversation_id FROM fb_engagements WHERE id=:id"),
+                                 {"id": rid})).scalar()
+    if existing:
+        await chatwoot_notify.escalate(existing, platform=platform, counterpart=counterpart,
+                                       lead_type=lead_type, reason=reason)
+        return
     cid = await chatwoot_notify.open_handover(
         platform=platform, device_id=device_id, counterpart=counterpart,
         phone=lead.phone_e164 if lead else None, lead_type=lead_type, reason=reason,
@@ -708,7 +737,64 @@ async def _handover_notify(db, device_id: str, platform: str, rid: int, counterp
         await db.commit()
 
 
-async def _claim_dm(db, device_id, tk, body, row, lead=None) -> ClaimResponse:
+async def _mirror_incoming(db, device_id: str, pf: str, rid: int | None, counterpart: str, lead,
+                           cid: int | None, history: list[dict], new: str, open_new: bool = True) -> int | None:
+    """11-11: 客户私信 → 立即同步进 Chatwoot (模型照常回)。已有会话就追加, 没有就开一个 (不指派不提醒)。
+    history 含刚追加的这条。放在 commit 之后; Chatwoot 挂了不影响回复。"""
+    if not new or not rid:
+        return cid
+    if cid:
+        await chatwoot_notify.forward(cid, new)
+        return cid
+    if not open_new:
+        return None
+    cid = await chatwoot_notify.open_mirror(
+        platform=pf, device_id=device_id, counterpart=counterpart, phone=lead.phone_e164 if lead else None,
+        history=history[:-1], new_text=new, engagement_id=rid, source_text=lead.source_text if lead else None)
+    if cid:
+        await db.execute(text("UPDATE fb_engagements SET chatwoot_conversation_id=:c WHERE id=:id "
+                              "AND chatwoot_conversation_id IS NULL"), {"c": cid, "id": rid})
+        await db.commit()
+    return cid
+
+
+async def _night_reply(db, rds, device_id: str, row, body, history: list[dict], lead, pf: str) -> ClaimResponse | None:
+    """已转人工的会话, 越南时间 0-8 点客户来消息 → 模型代回 (history 已含这条并已提交)。None = 不代回。"""
+    key = f"night_replies:{row.id}:{datetime.now(VNT).strftime('%Y%m%d')}"
+    try:
+        n = int(await rds.get(key) or 0)
+    except Exception:
+        n = 0
+    if n >= NIGHT_MAX_REPLIES:
+        log.info("engagement_skip", device_id=device_id, platform=pf, reason="night_cap", id=row.id)
+        return None
+    destination = row.destination
+    if not destination and pf not in OUTREACH:
+        destination = await _destination(_transcript(history))
+    g = await _gen_dm(history, destination, pf, lead.region if lead else None, night=True)
+    reply = g["reply"]
+    status = "claimed" if reply else ("skipped" if (g["why"] or "").startswith("llm_skip") else "failed")
+    await db.execute(text(
+        "UPDATE fb_engagements SET our_reply=:r, status=:st, failure_reason=:fr, destination=:dest, "
+        "attempts=1, updated_at=now() WHERE id=:id"),
+        {"r": reply, "st": status, "fr": g["why"], "dest": destination, "id": row.id})
+    if g["opt_out"]:
+        await db.execute(text("UPDATE fb_engagements SET human_status='opted_out' WHERE id=:id"), {"id": row.id})
+        await _mark_lead(db, pf, row.lead_id, "opted_out")
+    await db.commit()
+    log.info("engagement_claim", device_id=device_id, kind="dm", platform=pf, id=row.id, status=status,
+             reason=g["why"], night=True)
+    if not reply:
+        return ClaimResponse(action="skip", id=row.id, reason=g["why"])
+    try:
+        await rds.incr(key)
+        await rds.expire(key, 86400)
+    except Exception:
+        pass
+    return ClaimResponse(action="reply", id=row.id, reply=reply)
+
+
+async def _claim_dm(db, device_id, tk, body, row, lead=None, rds=None, capped: bool = False) -> ClaimResponse:
     history: list[dict] = list(row.history) if row else []
     pf = body.platform
     if lead is None and pf in OUTREACH and row and row.lead_id:
@@ -727,19 +813,49 @@ async def _claim_dm(db, device_id, tk, body, row, lead=None) -> ClaimResponse:
             return ClaimResponse(action="skip", id=row.id if row else None, reason="reaction_only")
         body = body.model_copy(update={"their_text": cleaned})
     if row and row.handover:
-        # 已转人工: 不再自动回; 对方的新消息转进 Chatwoot 会话, 管理员能看到后续
+        # 已转人工: 白天不再自动回; 对方的新消息转进 Chatwoot 会话, 管理员能看到后续
+        # 11-11: 越南时间 0-8 点没人值班 → 模型代回 (_night_reply)
         new = _new_lines(body.their_text or "", history)
-        if new and row.chatwoot_conversation_id and row.human_status != "opted_out":
+        if new and row.human_status != "opted_out":
             history.append({"r": "them", "t": new[:1500], "at": _now_iso()})
             await db.execute(text("UPDATE fb_engagements SET history=CAST(:h AS jsonb), their_text=:tx, "
                                   "updated_at=now() WHERE id=:id"),
                              {"h": json.dumps(history, ensure_ascii=False), "tx": body.their_text, "id": row.id})
             await db.commit()
-            await chatwoot_notify.forward(row.chatwoot_conversation_id, new)
+            await _mirror_incoming(db, device_id, pf, row.id, body.counterpart, lead,
+                                   row.chatwoot_conversation_id, history, new)
+            if rds is not None and not capped and _vn_night():
+                resp = await _night_reply(db, rds, device_id, row, body, history, lead, pf)
+                if resp is not None:
+                    return resp
         else:
             await db.rollback()
         log.info("engagement_skip", device_id=device_id, platform=pf, reason="handover", id=row.id, forwarded=bool(new))
         return ClaimResponse(action="skip", id=row.id, reason="handover")
+    if capped:
+        # 今天这台机这个平台的私信回复到上限了: 不调 LLM 不回, 客户的话记进 history 并同步到 Chatwoot
+        new = _new_lines(body.their_text or "", history)
+        if not new:
+            await db.rollback()
+            return ClaimResponse(action="skip", id=row.id if row else None, reason="daily_cap")
+        history.append({"r": "them", "t": new[:1500], "at": _now_iso()})
+        params = {"d": device_id, "t": tk, "c": body.counterpart[:200], "tx": body.their_text,
+                  "h": json.dumps(history, ensure_ascii=False), "pf": pf, "lid": lead_id}
+        if row:
+            rid = (await db.execute(text(
+                "UPDATE fb_engagements SET their_text=:tx, history=CAST(:h AS jsonb), status='skipped', "
+                "failure_reason='daily_cap', updated_at=now() WHERE id=:id RETURNING id"), {**params, "id": row.id})).scalar()
+        else:
+            rid = (await db.execute(text(
+                "INSERT INTO fb_engagements (device_id, kind, thread_key, counterpart, their_text, brand, status, "
+                "failure_reason, history, handover, human_status, platform, lead_id) "
+                "VALUES (:d,'dm',:t,:c,:tx,true,'skipped','daily_cap',CAST(:h AS jsonb),false,'auto',:pf,CAST(:lid AS INT)) "
+                "ON CONFLICT (device_id, kind, thread_key) DO NOTHING RETURNING id"), params)).scalar()
+        await db.commit()
+        await _mirror_incoming(db, device_id, pf, rid, body.counterpart, lead,
+                               row.chatwoot_conversation_id if row else None, history, new)
+        log.info("engagement_skip", device_id=device_id, platform=pf, reason="daily_cap", id=rid, mirrored=True)
+        return ClaimResponse(action="skip", id=rid, reason="daily_cap")
     if row and row.turns >= MAX_TURNS_BY_PLATFORM.get(pf, MAX_DM_TURNS):
         # 聊到上限还在问 → 转人工 (进日报 + Chatwoot), 不再自动回
         new = _new_lines(body.their_text or "", history)
@@ -751,6 +867,8 @@ async def _claim_dm(db, device_id, tk, body, row, lead=None) -> ClaimResponse:
             {"id": row.id, "tx": body.their_text, "h": json.dumps(history, ensure_ascii=False)})
         await _mark_lead(db, pf, lead_id, "handover")
         await db.commit()
+        await _mirror_incoming(db, device_id, pf, row.id, body.counterpart, lead,
+                               row.chatwoot_conversation_id, history, new)
         await _handover_notify(db, device_id, pf, row.id, body.counterpart, lead, row.lead_type,
                                f"聊满 {row.turns} 条仍在继续, 请人工跟进", history)
         return ClaimResponse(action="skip", id=row.id, reason="max_turns")
@@ -811,6 +929,10 @@ async def _claim_dm(db, device_id, tk, body, row, lead=None) -> ClaimResponse:
              lead_id=lead_id, turn=(row.turns if row else 0) + 1)
     if rid is None:
         return ClaimResponse(action="skip", reason="race")
+    if not retry:
+        # 商家自动回复 (auto) 不单独开会话 (噪音); 已在同步的会话照常追加
+        await _mirror_incoming(db, device_id, pf, rid, body.counterpart, lead,
+                               row.chatwoot_conversation_id if row else None, history, new, open_new=not auto)
     if handover:
         # 有意向 → Chatwoot 通知管理员 (对话记录里带上我们这条将要发出的回复)
         hist_out = history + ([{"r": "us", "t": reply}] if reply else [])
@@ -862,7 +984,8 @@ async def _claim_comment(db, device_id, tk, body, row) -> ClaimResponse:
 async def result(body: ResultRequest, device_id: str = Depends(get_device_id),
                  db: AsyncSession = Depends(get_db), rds: redis.Redis = Depends(get_redis)):
     row = (await db.execute(text(
-        "SELECT kind, platform, our_reply, history FROM fb_engagements WHERE id=:id AND device_id=:d FOR UPDATE"),
+        "SELECT kind, platform, our_reply, history, chatwoot_conversation_id FROM fb_engagements "
+        "WHERE id=:id AND device_id=:d FOR UPDATE"),
         {"id": body.id, "d": device_id})).first()
     if not row:
         await db.rollback()
@@ -882,6 +1005,9 @@ async def result(body: ResultRequest, device_id: str = Depends(get_device_id),
     await db.commit()
     if body.success:
         await _cap_inc(rds, device_id, row.kind, row.platform)
+        if row.kind == "dm" and row.our_reply and row.chatwoot_conversation_id:
+            # 11-11: 模型的回复也同步进 Chatwoot, 坐席看到的是完整对话
+            await chatwoot_notify.post_bot_reply(row.chatwoot_conversation_id, row.our_reply, rds)
     log.info("engagement_result", device_id=device_id, id=body.id,
              status="sent" if body.success else "failed", reason=body.failure_reason)
     return {"ok": True}
