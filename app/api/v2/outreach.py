@@ -31,6 +31,7 @@ router = APIRouter()
 log = get_logger(__name__)
 
 HKT = timezone(timedelta(hours=8))
+VNT = timezone(timedelta(hours=7))
 CHANNELS = tuple(TABLE)                    # zalo | whatsapp
 # 每台每天最多给多少个陌生号码打招呼。WhatsApp/Zalo 对"短时间大量给陌生人发消息"封号很快,
 # 首页选 12-20 人/轮 + 循环跑几轮也不会超过这里。
@@ -139,6 +140,9 @@ def _greet_language(channel: str, region: str | None) -> str:
 _FOUND = {
     "google_maps": ("Their business and phone number are listed on Google Maps (SOURCE below)",
                     "you found their business on Google Maps"),
+    # 11-11: FB 群里旅行从业者的帖子 → 点发帖人头像 → Message 私信
+    "facebook_group": ("They published the post below in a Facebook travel group (SOURCE below)",
+                       "you saw their post in the travel group"),
 }
 _FOUND_DEFAULT = ("Their phone number was publicly posted in a travel post (SOURCE below)",
                   "you came across their post/contact in a travel group")
@@ -146,7 +150,7 @@ _FOUND_DEFAULT = ("Their phone number was publicly posted in a travel post (SOUR
 
 async def _gen_greeting(channel: str, region: str | None, source: str | None,
                         source_platform: str | None = None) -> str:
-    app = "Zalo" if channel == "zalo" else "WhatsApp"
+    app = {"zalo": "Zalo", "facebook": "Facebook Messenger"}.get(channel, "WhatsApp")
     vi = channel == "zalo" or region == "VN"
     found, how = _FOUND.get(source_platform or "", _FOUND_DEFAULT)
     system = _GREET_SYSTEM.format(app=app, language=_greet_language(channel, region), prices=price_lines(vi),
@@ -216,6 +220,9 @@ async def outreach_next(body: NextRequest, device_id: str = Depends(get_device_i
     room = DAILY_GREET_CAP[ch] - used
     if room <= 0:
         return NextResponse(channel=ch, reason="daily_cap")
+    if 0 <= datetime.now(VNT).hour < 8:
+        # 11-11 用户: 凌晨 (越南 0-8 点) 只回消息, 不主动打招呼。手机端也会挡, 这里兜底老版本
+        return NextResponse(channel=ch, reason="night")
     try:
         paused = await rds.get(_pause_key(device_id, ch))
     except Exception:

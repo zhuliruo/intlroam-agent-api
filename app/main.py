@@ -105,6 +105,8 @@ from app.api.v2 import chatwoot_outbox as chatwoot_outbox_api
 app.include_router(chatwoot_outbox_api.router, prefix="/api/v2", tags=["chatwoot"])
 from app.api.v2 import quota as quota_api
 app.include_router(quota_api.router, prefix="/api/v2", tags=["quota"])
+from app.api.v2 import fb_dm as fb_dm_api
+app.include_router(fb_dm_api.router, prefix="/api/v2", tags=["fb_dm"])
 
 @app.get("/")
 async def root():

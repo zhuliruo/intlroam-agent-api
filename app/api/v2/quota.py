@@ -8,7 +8,7 @@
               发帖: 个人帖 1/天、群帖 DEVICE_DAILY_GROUP_POSTS/天 (只报数, 不参与 done 判断:
                     群帖受可发的群数量限制, 很多机器一天凑不满, 拿它当条件 FB 就永远停不下来;
                     而每个 FB 阶段开头就会先尝试发帖, 评论跑满时发帖早已试过)
-  - tiktok    评论: tiktok_sessions 今日 comments_posted + replies_posted vs TIKTOK_DAILY_COMMENTS (默认 30)
+  - tiktok    评论: tiktok_sessions 今日 comments_posted + replies_posted vs TIKTOK_DAILY_COMMENTS (默认 50, 11-11 用户由 30 调到 50)
               (TikTok 以前没有日上限, 只靠 session 时长; 近几天单机 0-31 条/天)
               发帖: device_post_history 今日成功数 (只报数, 理由同上)
   - whatsapp / zalo  打招呼: outreach_cap Redis 计数 vs DAILY_GREET_CAP —— 和 /outreach/next 同一个 key;
@@ -36,9 +36,9 @@ log = get_logger(__name__)
 
 def tiktok_daily_comments() -> int:
     try:
-        return int(os.getenv("TIKTOK_DAILY_COMMENTS", "30"))
+        return int(os.getenv("TIKTOK_DAILY_COMMENTS", "50"))
     except ValueError:
-        return 30
+        return 50
 
 
 @router.get("/quota_status")

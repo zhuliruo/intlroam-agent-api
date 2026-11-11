@@ -251,6 +251,8 @@ async def outbox_result(body: ResultRequest, device_id: str = Depends(get_device
                 "updated_at=now() WHERE id=:id"), {"h": json.dumps(hist, ensure_ascii=False), "id": row.engagement_id})
         await db.commit()
         await chatwoot_notify.set_message_status(row.conversation_id, row.chatwoot_message_id, "delivered")
+        # 人工接手 → 指派给管理员, 之后客户新消息都会提醒 (同步会话原来是不指派的)
+        await chatwoot_notify.assign(row.conversation_id, label="human")
     else:
         reason = (body.failure_reason or "unknown")[:255]
         retry = row.attempts < MAX_ATTEMPTS and not reason.startswith(

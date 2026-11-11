@@ -493,11 +493,19 @@ the facts, payment, an order/account problem, a call), say the colleague will fo
 the morning. Do not set "handover" (it is already handed over)."""
 
 
+def _is_recruit(platform: str, history: list[dict]) -> bool:
+    """11-11: 我们在 FB 群里主动私信旅行从业者 (fb_dm.py) 开的会话 —— 第一条是我们的, 带 outreach 标记。"""
+    return platform not in OUTREACH and bool(history) and bool(history[0].get("outreach"))
+
+
 async def _gen_dm(history: list[dict], destination: str | None,
                   platform: str = "facebook", region: str | None = None, night: bool = False) -> dict:
     """→ {reply, handover, lead_type, opt_out, why}"""
     out = {"reply": None, "handover": False, "lead_type": None, "opt_out": False, "why": None}
-    if platform in OUTREACH:
+    recruit = _is_recruit(platform, history)
+    if recruit:
+        region = region or history[0].get("region")
+    if platform in OUTREACH or recruit:
         # 招募分销商的对话: 不报价、不发产品链接 (人工接手后再给), 只用分销事实
         brochure = brochure_url(platform, region)
         signup = signup_url(platform, region)
@@ -526,7 +534,7 @@ async def _gen_dm(history: list[dict], destination: str | None,
     lt = str(d.get("lead_type") or "").strip().lower()
     out["lead_type"] = lt if lt in _LEAD_TYPES else None
     out["handover"] = bool(d.get("handover")) and not night
-    out["opt_out"] = bool(d.get("opt_out")) and platform in OUTREACH
+    out["opt_out"] = bool(d.get("opt_out")) and (platform in OUTREACH or recruit)
     reply = str(d.get("reply") or "").strip()
     if not reply:
         # 11-09: LLM 判 skip (自动回复/垃圾) 时偶尔还带 handover=true —— skip 了就不该转人工
@@ -536,7 +544,7 @@ async def _gen_dm(history: list[dict], destination: str | None,
     if len(reply) > 500:
         out["why"] = "too_long"
         return out
-    if platform in OUTREACH:
+    if platform in OUTREACH or recruit:
         # 招募对话: 只许介绍材料链接; 金额只许是给定例子价, 编了就当失败 (下一条消息会重试)
         reply = strip_links_except(reply, [brochure, signup])
         if not reply or not prices_ok(reply):
@@ -593,6 +601,8 @@ def _cap_key(device_id: str, kind: str, platform: str) -> str:
 
 
 async def _cap_ok(rds, device_id: str, kind: str, platform: str = "facebook") -> bool:
+    if platform in OUTREACH:
+        return True     # 11-11 用户: WhatsApp/Zalo 私信回复不设上限, 只限每天新打招呼数 (outreach.DAILY_GREET_CAP)
     try:
         n = int(await rds.get(_cap_key(device_id, kind, platform)) or 0)
     except Exception:
@@ -738,13 +748,14 @@ async def _handover_notify(db, device_id: str, platform: str, rid: int, counterp
 
 
 async def _mirror_incoming(db, device_id: str, pf: str, rid: int | None, counterpart: str, lead,
-                           cid: int | None, history: list[dict], new: str, open_new: bool = True) -> int | None:
+                           cid: int | None, history: list[dict], new: str, open_new: bool = True,
+                           alert: bool = False) -> int | None:
     """11-11: 客户私信 → 立即同步进 Chatwoot (模型照常回)。已有会话就追加, 没有就开一个 (不指派不提醒)。
     history 含刚追加的这条。放在 commit 之后; Chatwoot 挂了不影响回复。"""
     if not new or not rid:
         return cid
     if cid:
-        await chatwoot_notify.forward(cid, new)
+        await chatwoot_notify.forward(cid, new, alert=alert)
         return cid
     if not open_new:
         return None
@@ -769,7 +780,7 @@ async def _night_reply(db, rds, device_id: str, row, body, history: list[dict], 
         log.info("engagement_skip", device_id=device_id, platform=pf, reason="night_cap", id=row.id)
         return None
     destination = row.destination
-    if not destination and pf not in OUTREACH:
+    if not destination and pf not in OUTREACH and not _is_recruit(pf, history):
         destination = await _destination(_transcript(history))
     g = await _gen_dm(history, destination, pf, lead.region if lead else None, night=True)
     reply = g["reply"]
@@ -822,8 +833,10 @@ async def _claim_dm(db, device_id, tk, body, row, lead=None, rds=None, capped: b
                                   "updated_at=now() WHERE id=:id"),
                              {"h": json.dumps(history, ensure_ascii=False), "tx": body.their_text, "id": row.id})
             await db.commit()
-            await _mirror_incoming(db, device_id, pf, row.id, body.counterpart, lead,
-                                   row.chatwoot_conversation_id, history, new)
+            cid = await _mirror_incoming(db, device_id, pf, row.id, body.counterpart, lead,
+                                         row.chatwoot_conversation_id, history, new, alert=True)
+            if cid and not row.chatwoot_conversation_id:
+                await chatwoot_notify.assign(cid, label="human")     # 转人工时 Chatwoot 没开成, 这次补开 → 也要指派提醒
             if rds is not None and not capped and _vn_night():
                 resp = await _night_reply(db, rds, device_id, row, body, history, lead, pf)
                 if resp is not None:
@@ -856,7 +869,8 @@ async def _claim_dm(db, device_id, tk, body, row, lead=None, rds=None, capped: b
                                row.chatwoot_conversation_id if row else None, history, new)
         log.info("engagement_skip", device_id=device_id, platform=pf, reason="daily_cap", id=rid, mirrored=True)
         return ClaimResponse(action="skip", id=rid, reason="daily_cap")
-    if row and row.turns >= MAX_TURNS_BY_PLATFORM.get(pf, MAX_DM_TURNS):
+    max_turns = 5 if _is_recruit(pf, history) else MAX_TURNS_BY_PLATFORM.get(pf, MAX_DM_TURNS)
+    if row and row.turns >= max_turns:
         # 聊到上限还在问 → 转人工 (进日报 + Chatwoot), 不再自动回
         new = _new_lines(body.their_text or "", history)
         if new:
@@ -886,7 +900,7 @@ async def _claim_dm(db, device_id, tk, body, row, lead=None, rds=None, capped: b
         history.append({"r": "them", "t": new[:1500], "at": _now_iso()})
 
     destination = row.destination if row else None
-    if not destination and pf not in OUTREACH:          # 招募对话不推产品, 省一次 LLM
+    if not destination and pf not in OUTREACH and not _is_recruit(pf, history):   # 招募对话不推产品, 省一次 LLM
         destination = await _destination(_transcript(history))
     auto = _auto_reply_reason(pf, history) if not retry else None
     if auto:

@@ -303,10 +303,41 @@ async def note(conversation_id: int, text: str) -> bool:
         return False
 
 
-async def forward(conversation_id: int, text: str) -> bool:
-    """转人工之后对方又发来的消息 → 追加进同一个会话 (incoming, 会触发未读提醒)。"""
+async def _ensure_assigned(client, conversation_id: int) -> None:
+    c = _cfg()
+    if not c["assignee"]:
+        return
+    conv = await _call(client, "GET", f"/conversations/{conversation_id}")
+    cur = ((conv.get("meta") or {}).get("assignee") or {}).get("id")
+    if not cur:
+        await _call(client, "POST", f"/conversations/{conversation_id}/assignments",
+                    json={"assignee_id": int(c["assignee"])})
+
+
+async def assign(conversation_id: int, label: str | None = None) -> bool:
+    """会话没人负责就指派给管理员 (之后客户每条新消息都会推送提醒)。"""
+    if not enabled() or not conversation_id:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            await _ensure_assigned(client, conversation_id)
+            if label:
+                conv = await _call(client, "GET", f"/conversations/{conversation_id}/labels")
+                labels = list(dict.fromkeys((conv.get("payload") or []) + [label]))
+                await _call(client, "POST", f"/conversations/{conversation_id}/labels", json={"labels": labels})
+        return True
+    except Exception as e:
+        log.warning("chatwoot_assign_failed", conversation_id=conversation_id, err=str(e)[:200])
+        return False
+
+
+async def forward(conversation_id: int, text: str, alert: bool = False) -> bool:
+    """对方新消息 → 追加进同一个会话 (incoming)。
+    alert=True (人工在跟的会话, 11-11 用户: 客户回了新消息要提醒, 别漏): 确保已指派 + 私有备注 @管理员
+    (mention 单独走推送/站内提醒, 比"已指派会话有新消息"更醒目)。"""
     if not enabled() or not conversation_id or not text.strip():
         return False
+    c = _cfg()
     try:
         async with httpx.AsyncClient() as client:
             await _call(client, "POST", f"/conversations/{conversation_id}/messages",
@@ -314,6 +345,13 @@ async def forward(conversation_id: int, text: str) -> bool:
             # 会话可能已被管理员 resolve, 新消息进来要重新打开
             await _call(client, "POST", f"/conversations/{conversation_id}/toggle_status",
                         json={"status": "open"})
+            if alert:
+                await _ensure_assigned(client, conversation_id)
+                if c["assignee"]:
+                    uid = int(c["assignee"])
+                    await _call(client, "POST", f"/conversations/{conversation_id}/messages",
+                                json={"content": f"[@admin](mention://user/{uid}/admin) 人工跟进中的客户发来新消息, 请回复 👆",
+                                      "message_type": "outgoing", "private": True})
         return True
     except Exception as e:
         log.warning("chatwoot_forward_failed", conversation_id=conversation_id, err=str(e)[:200])
