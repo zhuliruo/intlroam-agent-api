@@ -37,6 +37,10 @@ CHANNELS = tuple(TABLE)                    # zalo | whatsapp
 DAILY_GREET_CAP = {"whatsapp": 40, "zalo": 40}
 MAX_BATCH = 20
 STALE_ASSIGN = timedelta(hours=3)          # 派出去 3 小时没回填 → 放回池子
+# 11-11: 真机 (Pixel 4 XL / WA Business) 账号被 WhatsApp 限制 "You can't start new chats" —— 会话页没有输入框,
+# 招呼全部停在 Draft, 手机每条报 no_input, 每条线索白烧一次 attempts (3 次就永久 failed)。
+# 手机现在认得出限制提示 (failure_reason=account_restricted…) → 线索原样放回池子, 这台机该渠道暂停一段时间
+RESTRICT_PAUSE = timedelta(hours=12)
 
 
 def outreach_thread_key(platform: str, phone: str) -> str:
@@ -194,6 +198,10 @@ def _greet_cap_key(device_id: str, channel: str) -> str:
     return f"outreach_cap:{device_id}:{channel}:{datetime.now(HKT).strftime('%Y%m%d')}"
 
 
+def _pause_key(device_id: str, channel: str) -> str:
+    return f"outreach_pause:{device_id}:{channel}"
+
+
 @router.post("/outreach/next", response_model=NextResponse)
 async def outreach_next(body: NextRequest, device_id: str = Depends(get_device_id),
                         db: AsyncSession = Depends(get_db), rds: redis.Redis = Depends(get_redis)):
@@ -208,6 +216,13 @@ async def outreach_next(body: NextRequest, device_id: str = Depends(get_device_i
     room = DAILY_GREET_CAP[ch] - used
     if room <= 0:
         return NextResponse(channel=ch, reason="daily_cap")
+    try:
+        paused = await rds.get(_pause_key(device_id, ch))
+    except Exception:
+        paused = None
+    if paused:
+        log.info("outreach_paused", device_id=device_id, channel=ch, why=str(paused)[:120])
+        return NextResponse(channel=ch, reason="paused")
     n = min(body.count, room)
 
     # 超时没回填的派单放回池子 (手机中途被杀/装包)
@@ -261,9 +276,23 @@ async def outreach_result(body: ResultRequest, device_id: str = Depends(get_devi
         await db.rollback()
         return {"ok": False, "reason": "not_assigned"}
     if not body.success:
+        fr = (body.failure_reason or "")[:200]
+        if fr.startswith("account_restricted"):
+            # 这台机的账号被限制, 不是号码的问题: 线索原样放回池子 (不算一次尝试), 这台机该渠道暂停 RESTRICT_PAUSE
+            await db.execute(text(
+                f"UPDATE {t} SET status='new', assigned_device=NULL, attempts=GREATEST(attempts-1, 0), "
+                f"failure_reason=:fr, updated_at=now() WHERE id=:id"), {"fr": fr, "id": row.id})
+            await db.commit()
+            try:
+                await rds.set(_pause_key(device_id, body.channel), fr, ex=int(RESTRICT_PAUSE.total_seconds()))
+            except Exception:
+                pass
+            log.warning("outreach_account_restricted", device_id=device_id, channel=body.channel,
+                        lead_id=row.id, reason=fr[:120])
+            return {"ok": True}
         # not_on_app 是号码本身的属性, 永久; already_chatted = 这台机以前 (人工) 聊过, 永久不再打招呼;
-        # 其他失败 (打不开/找不到按钮) 放回池子给下一轮 (最多 3 次)
-        st = {"not_on_app": "not_on_app", "already_chatted": "already_contacted"}.get(body.failure_reason or "", "failed")
+        # 其他失败 (打不开/找不到按钮) 放回池子给下一轮 (最多 3 次)。手机 11-11 起在 no_input 后面带屏幕文字 (no_input|screen:…)
+        st = {"not_on_app": "not_on_app", "already_chatted": "already_contacted"}.get(fr.split("|")[0], "failed")
         await db.execute(text(
             f"UPDATE {t} SET status = CASE WHEN :st='failed' AND attempts < 3 THEN 'new' ELSE :st END, "
             f"assigned_device = CASE WHEN :st='failed' AND attempts < 3 THEN NULL ELSE assigned_device END, "

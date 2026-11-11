@@ -327,6 +327,10 @@ def _auto_reply_reason(platform: str, history: list[dict]) -> str | None:
     if any(h.get("r") == "them" for h in prior):
         return None
     text = history[-1].get("t", "").strip()
+    if _human_tail(text):
+        # 11-11 Pixel 4a +968 9094 3457: 商家模板 "Thank you for your message, we will respond…" 后面跟了一句真人的 "Yes",
+        # 两条一起到 (手机把最近 3 条拼起来) → 整段被判自动回复跳过, 真人那句没人理。模板后面还有话 → 当真人回复处理
+        return None
     last_us = next((h for h in reversed(prior) if h.get("r") == "us" and h.get("at")), None)
     if last_us and len(text) >= AUTO_REPLY_FAST_MIN_LEN:
         try:
@@ -345,8 +349,26 @@ def _auto_reply_reason(platform: str, history: list[dict]) -> str | None:
 _AUTO_REPLY_WEAK_START_RE = re.compile(
     r"^\W*" + _GREET_PREFIX + r"thank(s| you)( so much| very much)? for (your (message|inquiry|enquiry)|messaging)\b", re.I)
 _AUTO_REPLY_TEMPLATE_RE = re.compile(
-    r"how (can|may) (i|we) (help|assist|serve)|(will|shall) (get back|respond|reply|revert)|as soon as possible|"
+    r"how (can|may) (i|we) (help|assist|serve)|(will|shall) (get back|respond|reply|revert|contact you)|as soon as possible|"
     r"kindly (write|send|provide|share)|for (any|all) (enquiries|inquiries|questions)|kindest regards|best regards", re.I)
+
+
+def _human_tail(text: str) -> str | None:
+    """模板句之后还有的短句 (≤300 字) —— 多半是真人接着说的。没有模板句 / 没有尾巴 → None。"""
+    lines = [l.strip() for l in (text or "").split("\n") if l.strip()]
+    if len(lines) < 2:
+        return None
+    def _tpl(l: str) -> bool:
+        return bool(_AUTO_REPLY_START_RE.search(l) or _AUTO_REPLY_ANY_RE.search(l) or
+                    _AUTO_REPLY_TEMPLATE_RE.search(l) or _AUTO_REPLY_WEAK_START_RE.search(l))
+    idx = max((i for i, l in enumerate(lines) if _tpl(l)), default=-1)
+    tail = lines[idx + 1:]
+    if idx < 0 or not tail or sum(len(l) for l in tail) > 120:
+        return None
+    # 模板的后半段 ("Please send …" / "For bookings …" / "Our office hours …") 不算真人
+    if any(re.match(r"^(please|kindly|for |our |we |visit|call|whatsapp|office|working hours|contact us)", l, re.I) for l in tail):
+        return None
+    return "\n".join(tail)
 
 
 def _looks_auto(text: str) -> bool:
@@ -598,7 +620,8 @@ async def _claim(body: ClaimRequest, device_id: str, db, rds) -> ClaimResponse:
         lead = await _find_lead(db, device_id, body)
         phone = (lead.phone_e164 if lead else None) or _phone_from(body)
         tk = (outreach_thread_key(body.platform, phone) if phone
-              else thread_key(kind, body.counterpart, body.context, body.platform))
+              else (await _thread_by_name(db, device_id, body.platform, body.counterpart)
+                    or thread_key(kind, body.counterpart, body.context, body.platform)))
     else:
         tk = thread_key(kind, body.counterpart, body.context, body.platform)
     row = (await db.execute(text(
@@ -645,11 +668,25 @@ async def _find_lead(db, device_id: str, body: ClaimRequest):
             return r
     name = (body.counterpart or "").strip()
     if name:
+        # 11-11: 原来限定 status='greeted' —— 对方第一次回复后线索变成 replied/handover, Zalo 通知里又只有名字
+        # (没号码), 第二条消息就按名字找不到线索 → thread_key 变成按名字的 → 查不到会话行 → 被当 not_a_lead 跳过,
+        # 对方的话一直没人回 (手机上显示未读)。只要是这台机打过招呼的 (有 greeted_at) 都认。
         return (await db.execute(text(
-            f"SELECT id, phone_e164, source_text, region FROM {t} WHERE assigned_device=:d AND status='greeted' "
+            f"SELECT id, phone_e164, source_text, region FROM {t} WHERE assigned_device=:d AND greeted_at IS NOT NULL "
             f"AND lower(display_name)=lower(:n) ORDER BY greeted_at DESC LIMIT 1"),
             {"d": device_id, "n": name})).first()
     return None
+
+
+async def _thread_by_name(db, device_id: str, platform: str, counterpart: str) -> str | None:
+    """线索按名字也找不到时 (打招呼时没读到显示名), 退一步按会话行的 counterpart 找我们打过招呼的线程。"""
+    name = (counterpart or "").strip()
+    if not name:
+        return None
+    return (await db.execute(text(
+        "SELECT thread_key FROM fb_engagements WHERE device_id=:d AND platform=:pf AND kind='dm' "
+        "AND lead_id IS NOT NULL AND lower(counterpart)=lower(:c) ORDER BY updated_at DESC LIMIT 1"),
+        {"d": device_id, "pf": platform, "c": name})).scalar()
 
 
 async def _mark_lead(db, platform: str, lead_id: int | None, status: str) -> None:
