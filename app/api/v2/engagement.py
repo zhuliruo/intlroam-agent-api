@@ -139,25 +139,27 @@ _RESELLER_FACTS = """RESELLER FACTS (these are your PRODUCT FACTS — the only t
   NEVER invent any other price, discount, percentage or commission.
 - Partner brochure (PDF): {brochure}
   Send this link when they ask for materials / a catalogue / more info / details in writing.
-- Partner portal (free sign-up, email verification only): {signup}
-  Send it EXACTLY as written — the plain homepage, never add a path like /register or any ?parameters.
-  After registering they can log in and see ALL products and their partner prices, and order
-  or top up by themselves. Send this link when they ask for prices / the full product list /
-  how to start or sign up, or say they are interested."""
+- Partner page on our official website: {signup}
+  Send it EXACTLY as written — never change the path or add ?parameters.
+  It shows our company details and the partnership options (reseller / affiliate / corporate);
+  the "Become a Reseller" button there leads to free sign-up (email verification only), after
+  which they can log in, see ALL products and their partner prices, and order or top up by
+  themselves. Send this link when they ask for prices / the full product list / how to start or
+  sign up, or say they are interested."""
 
 _OUTREACH_TASK = """This is a {chat} chat. You messaged them first (your greeting is the first
 "You" line) to invite them to become a part-time reseller. Conversation below (You = you,
 Customer = them). Write your NEXT message only.
 - Reply in the language they use. 1-2 short sentences. Friendly, no pressure. The ONLY link
-  links you may ever send are the brochure link and the sign-up link from RESELLER FACTS
+  links you may ever send are the brochure link and the partner page link from RESELLER FACTS
   (copy them exactly; send each at most once in the chat unless they ask again).
 - Answer briefly from RESELLER FACTS; if they ask something not covered, say a colleague will
   explain and hand over.
 - If they ask for materials / brochure / catalogue, send the brochure link; if they ask for
-  prices / the full product list / how to start, send the sign-up link and say they can see all
-  products and partner prices after registering (one short line around each link).
+  prices / the full product list / how to start, send the partner page link and say they can sign
+  up there and see all products and partner prices (one short line around each link).
 - Set "handover": true (and say a colleague will contact them shortly with the details; if
-  you haven't sent them yet, add the brochure and sign-up links) only when their OWN WORDS show interest:
+  you haven't sent them yet, add the brochure and partner page links) only when their OWN WORDS show interest:
   they ask for details / prices / commission / how to start / to try, say yes / interested,
   OR they want to buy eSIMs for themselves, OR they ask for a call or a real person.
 - NOT interest (no handover): an emoji, a sticker, a photo, "ok", "thanks", "hi", "who is
