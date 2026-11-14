@@ -63,6 +63,11 @@ MAX_ATTEMPTS = 2          # 同一条消息生成/发送失败最多重试几次
 VNT = timezone(timedelta(hours=7))
 NIGHT_HOURS = (0, 8)
 NIGHT_MAX_REPLIES = 4
+# 11-14 用户选 B: 已转人工的 Messenger 会话白天也由模型继续回 (Chatwoot 照样提醒坐席)。
+# 每会话每天最多代回几条; 坐席在 Chatwoot 亲自回过 (history 里 by=human) 的 HUMAN_QUIET_H 小时内白天不插话, 免得两个声音。
+DAY_COVER_PLATFORMS = ("facebook",)
+DAY_COVER_MAX_REPLIES = 6
+HUMAN_QUIET_H = 12
 
 
 def _vn_night(now: datetime | None = None) -> bool:
@@ -392,6 +397,23 @@ def _looks_auto(text: str) -> bool:
     return bool(_AUTO_REPLY_WEAK_START_RE.search(text) and _AUTO_REPLY_TEMPLATE_RE.search(text))
 
 
+def _templated(text: str) -> bool:
+    t = (text or "").strip()
+    return bool(t) and (_looks_auto(t) or bool(_AUTO_REPLY_TEMPLATE_RE.search(t)))
+
+
+def _bot_loop(history: list[dict]) -> bool:
+    """11-14: 对方是自动应答/AI 客服 (Rodhess: 我们回一句, 它几秒后又来 "I've shared that link with our team, someone
+    will get back to you")。手机扫收件箱 20 分钟一次, 看不出回复速度 → 按内容: 对方最新一条像模板, 且我们回过之前
+    那条也像模板 → 不再回 (每个机器人最多陪聊一句)。history 已含对方最新这条。"""
+    them = [i for i, h in enumerate(history) if h.get("r") == "them"]
+    if len(them) < 2 or not _templated(history[them[-1]].get("t", "")):
+        return False
+    prev = them[-2]
+    replied_between = any(h.get("r") == "us" for h in history[prev + 1:them[-1]])
+    return replied_between and _templated(history[prev].get("t", ""))
+
+
 _CJK_RE = re.compile(r"[぀-ヿ㐀-鿿가-힯]")
 _ARABIC_RE = re.compile(r"[؀-ۿ]")
 _VI_RE = re.compile(r"[ăâđêôơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹ]", re.I)
@@ -495,13 +517,38 @@ the facts, payment, an order/account problem, a call), say the colleague will fo
 the morning. Do not set "handover" (it is already handed over)."""
 
 
+_DAY_COVER = """HANDOVER COVER: this conversation has been flagged for a colleague, who has been alerted and will
+join soon, but until they do you keep the conversation going. Read the whole conversation, including anything
+a colleague said (they are "You" too), and answer the customer's latest message briefly and helpfully from the
+facts. Do not contradict or repeat what was already said. Do NOT promise new prices, discounts, deals or
+deadlines. If they need something only the colleague can do (a price quote beyond the facts, payment, an
+order/account problem, a call), say a colleague will follow up with them shortly. Do not set "handover"
+(it is already handed over)."""
+
+
+def _human_replied_recently(history: list[dict], hours: int = HUMAN_QUIET_H) -> bool:
+    """坐席在 Chatwoot 亲自回过 (chatwoot_outbox 写 {r:us, by:human, at}) 且在 hours 小时内"""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    for h in reversed(history):
+        if h.get("r") == "us" and h.get("by") == "human":
+            try:
+                at = datetime.fromisoformat(str(h.get("at")).replace("Z", "+00:00"))
+                if at.tzinfo is None:
+                    at = at.replace(tzinfo=timezone.utc)
+                return at >= cutoff
+            except Exception:
+                return True               # 没时间戳: 保守当作刚回过
+    return False
+
+
 def _is_recruit(platform: str, history: list[dict]) -> bool:
     """11-11: 我们在 FB 群里主动私信旅行从业者 (fb_dm.py) 开的会话 —— 第一条是我们的, 带 outreach 标记。"""
     return platform not in OUTREACH and bool(history) and bool(history[0].get("outreach"))
 
 
 async def _gen_dm(history: list[dict], destination: str | None,
-                  platform: str = "facebook", region: str | None = None, night: bool = False) -> dict:
+                  platform: str = "facebook", region: str | None = None, night: bool = False,
+                  cover: str | None = None) -> dict:
     """→ {reply, handover, lead_type, opt_out, why}"""
     out = {"reply": None, "handover": False, "lead_type": None, "opt_out": False, "why": None}
     recruit = _is_recruit(platform, history)
@@ -528,7 +575,7 @@ async def _gen_dm(history: list[dict], destination: str | None,
                                _RULES.format(length=_LENGTH["dm"]), facts + note]
                               + ([_TT_DM_NO_LINK] if platform == "tiktok" else []))
     if night:
-        system += "\n\n" + _NIGHT_COVER
+        system += "\n\n" + (cover or _NIGHT_COVER)
     d = await _llm_json(system, "Conversation:\n" + _transcript(history), 0.6)
     if d is None:
         out["why"] = "llm_failed"
@@ -771,20 +818,27 @@ async def _mirror_incoming(db, device_id: str, pf: str, rid: int | None, counter
     return cid
 
 
-async def _night_reply(db, rds, device_id: str, row, body, history: list[dict], lead, pf: str) -> ClaimResponse | None:
-    """已转人工的会话, 越南时间 0-8 点客户来消息 → 模型代回 (history 已含这条并已提交)。None = 不代回。"""
-    key = f"night_replies:{row.id}:{datetime.now(VNT).strftime('%Y%m%d')}"
+async def _night_reply(db, rds, device_id: str, row, body, history: list[dict], lead, pf: str,
+                       day: bool = False) -> ClaimResponse | None:
+    """已转人工的会话由模型代回 (history 已含这条并已提交)。None = 不代回。
+    day=False: 越南时间 0-8 点没人值班; day=True: 白天 (11-14 用户选 B, 仅 DAY_COVER_PLATFORMS)。"""
+    mode = "day" if day else "night"
+    key = f"{mode}_replies:{row.id}:{datetime.now(VNT).strftime('%Y%m%d')}"
     try:
         n = int(await rds.get(key) or 0)
     except Exception:
         n = 0
-    if n >= NIGHT_MAX_REPLIES:
-        log.info("engagement_skip", device_id=device_id, platform=pf, reason="night_cap", id=row.id)
+    if pf == "facebook" and _bot_loop(history):
+        log.info("engagement_skip", device_id=device_id, platform=pf, reason="bot_loop", id=row.id, mode=mode)
+        return None
+    if n >= (DAY_COVER_MAX_REPLIES if day else NIGHT_MAX_REPLIES):
+        log.info("engagement_skip", device_id=device_id, platform=pf, reason=f"{mode}_cap", id=row.id)
         return None
     destination = row.destination
     if not destination and pf not in OUTREACH and not _is_recruit(pf, history):
         destination = await _destination(_transcript(history))
-    g = await _gen_dm(history, destination, pf, lead.region if lead else None, night=True)
+    g = await _gen_dm(history, destination, pf, lead.region if lead else None, night=True,
+                      cover=_DAY_COVER if day else _NIGHT_COVER)
     reply = g["reply"]
     status = "claimed" if reply else ("skipped" if (g["why"] or "").startswith("llm_skip") else "failed")
     await db.execute(text(
@@ -796,7 +850,7 @@ async def _night_reply(db, rds, device_id: str, row, body, history: list[dict], 
         await _mark_lead(db, pf, row.lead_id, "opted_out")
     await db.commit()
     log.info("engagement_claim", device_id=device_id, kind="dm", platform=pf, id=row.id, status=status,
-             reason=g["why"], night=True)
+             reason=g["why"], night=not day, day_cover=day)
     if not reply:
         return ClaimResponse(action="skip", id=row.id, reason=g["why"])
     try:
@@ -839,8 +893,13 @@ async def _claim_dm(db, device_id, tk, body, row, lead=None, rds=None, capped: b
                                          row.chatwoot_conversation_id, history, new, alert=True)
             if cid and not row.chatwoot_conversation_id:
                 await chatwoot_notify.assign(cid, label="human")     # 转人工时 Chatwoot 没开成, 这次补开 → 也要指派提醒
-            if rds is not None and not capped and _vn_night():
-                resp = await _night_reply(db, rds, device_id, row, body, history, lead, pf)
+            if rds is not None and not capped:
+                if _vn_night():
+                    resp = await _night_reply(db, rds, device_id, row, body, history, lead, pf)
+                elif pf in DAY_COVER_PLATFORMS and not _human_replied_recently(history):
+                    resp = await _night_reply(db, rds, device_id, row, body, history, lead, pf, day=True)
+                else:
+                    resp = None
                 if resp is not None:
                     return resp
         else:
@@ -887,6 +946,11 @@ async def _claim_dm(db, device_id, tk, body, row, lead=None, rds=None, capped: b
                                row.chatwoot_conversation_id, history, new)
         await _handover_notify(db, device_id, pf, row.id, body.counterpart, lead, row.lead_type,
                                f"聊满 {row.turns} 条仍在继续, 请人工跟进", history)
+        if new and rds is not None and pf in DAY_COVER_PLATFORMS and not _human_replied_recently(history):
+            # 11-14 B: 转人工的同时模型接着回这一条 (坐席已收到提醒)
+            resp = await _night_reply(db, rds, device_id, row, body, history, lead, pf, day=not _vn_night())
+            if resp is not None:
+                return resp
         return ClaimResponse(action="skip", id=row.id, reason="max_turns")
     new = _new_lines(body.their_text or "", history)
     retry = False
@@ -905,6 +969,8 @@ async def _claim_dm(db, device_id, tk, body, row, lead=None, rds=None, capped: b
     if not destination and pf not in OUTREACH and not _is_recruit(pf, history):   # 招募对话不推产品, 省一次 LLM
         destination = await _destination(_transcript(history))
     auto = _auto_reply_reason(pf, history) if not retry else None
+    if not auto and not retry and pf == "facebook" and _bot_loop(history):
+        auto = "bot_loop"
     if auto:
         # 商家自动回复: 不调 LLM, 不回, 不改线索状态; 原文留在 history 里, 真人后续回复时有上下文
         log.info("outreach_auto_reply", platform=pf, lead_id=lead_id, why=auto, text=new[:120])
